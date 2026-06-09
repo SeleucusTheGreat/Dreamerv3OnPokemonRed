@@ -386,10 +386,10 @@ def create_envs(num_envs, rom_path, state_dir="StartingFiles", wind="null"):
     print(f"Initializing {num_envs} PyBoy Environments...")
     
     for i in range(num_envs):
-        if i < 4:
+        if i < 3:
             paths = [os.path.join(state_dir, start_state)]
         else:
-            start_idx = (i - 4) % len(other_states)
+            start_idx = (i - 3) % len(other_states)
             rotated_states = other_states[start_idx:] + other_states[:start_idx]
             paths = [os.path.join(state_dir, s) for s in rotated_states]
         

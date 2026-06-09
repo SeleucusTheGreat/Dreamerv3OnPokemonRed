@@ -15,17 +15,17 @@ class Policy(nn.Module):
         self.device = device
         self.envs = envs
         self.action_dim = envs[0].action_space.n 
-        self.buffer_size = 1500000
-        self.recurrent_dim = 2048 
-        self.rows = 40           
-        self.cols = 40
+        self.buffer_size = 1000000
+        self.recurrent_dim = 1024 
+        self.rows = 32           
+        self.cols = 32
         self.latent_dim = self.rows * self.cols
         self.total_num_episodes = 10000
-        self.training_per_episodes = 200
+        self.training_per_episodes = 300
         self.seed = 1234
         self.number_of_sequences = 64 # Batch size
         self.steps_per_sequence = 64
-        self.curiosity_scale = 1.0  
+        self.curiosity_scale = 1  
         
         self.seedMeDaddy(self.seed)
 
@@ -52,7 +52,6 @@ class Policy(nn.Module):
         self.dreamer.loadCheckpoints()
         csv_filename = "pokemon_training_metrics.csv"
         
-        # Expanded metrics header tracking world-model curiosity and intrinsic evaluation stats
         headers =[
             "envSteps", "gradientSteps", "totalReward", 
             "worldModelLoss", "reconstructionLoss", "rewardPredictorLoss", "klLoss", "goalLoss", "teamLoss", "itemLoss", "curiosityLoss",
@@ -79,7 +78,7 @@ class Policy(nn.Module):
         # --- Initial Buffer Fill ---
         print("\n" + "="*50)
         print("[*] Gathering initial data from environment...")
-        initial_score = self.dreamer.Play_the_game(number_of_episodes_per_env=0) 
+        initial_score = self.dreamer.Play_the_game(number_of_episodes_per_env=1) 
         print(f"[*] Initial Collection Score: {initial_score}")
         print("="*50 + "\n")
 
@@ -154,6 +153,8 @@ class Policy(nn.Module):
             # --- Play Game with Updated Policy ---
             print(f"[*] Stepping environment with updated policy...")
             avg_score = self.dreamer.Play_the_game(number_of_episodes_per_env=1)
+
+            self.dreamer.buffer.print_diagnostics()
             
             # Print cleanly formatted metrics
             print(f"    > Total Env Steps : {self.dreamer.total_num_steps}")
