@@ -21,7 +21,7 @@ class Policy(nn.Module):
         self.cols = 32
         self.latent_dim = self.rows * self.cols
         self.total_num_episodes = 10000
-        self.training_per_episodes = 300
+        self.training_per_episodes = 200
         self.seed = 1234
         self.number_of_sequences = 64 # Batch size
         self.steps_per_sequence = 64
@@ -78,7 +78,7 @@ class Policy(nn.Module):
         # --- Initial Buffer Fill ---
         print("\n" + "="*50)
         print("[*] Gathering initial data from environment...")
-        initial_score = self.dreamer.Play_the_game(number_of_episodes_per_env=1) 
+        initial_score = self.dreamer.Play_the_game(number_of_episodes_per_env=0) 
         print(f"[*] Initial Collection Score: {initial_score}")
         print("="*50 + "\n")
 

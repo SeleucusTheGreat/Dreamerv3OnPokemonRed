@@ -59,7 +59,7 @@ class PokemonRedEnv(gym.Env):
         self.pyboy.set_emulation_speed(speed) # 0 = Unlimited speed for training
         
         # Budget Constants
-        self.init_steps = 20000
+        self.init_steps = 10000
 
 
         # --- REWARDS CONSTANTS ---

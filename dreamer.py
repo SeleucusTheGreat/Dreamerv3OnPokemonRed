@@ -2,6 +2,7 @@ import os
 import glob
 import copy
 import random
+from turtle import pos
 import gymnasium as gym
 import numpy as np
 import matplotlib.pyplot as plt
@@ -26,7 +27,7 @@ class TwoHotEncoding:
     def __init__(self, min=-10, max=10, num_bins=255, device="cuda"):
         self.device = device
         self.num_bins = num_bins
-        # Linear bins in symlog space
+        # Linear bins in symlog space (symmetric range for stable value/reward estimation)
         self.bins = torch.linspace(min, max, num_bins, device=device)
         # The actual values the bins represent
         self.bin_values = symexp(self.bins)
@@ -36,16 +37,18 @@ class TwoHotEncoding:
         x = symlog(x)
         x = torch.clamp(x, self.bins[0], self.bins[-1])
         
-        # Find the indices of the two closest bins
+        # Find the fractional position relative to the bin spacing
         pos = (x - self.bins[0]) / (self.bins[1] - self.bins[0])
-        low = torch.floor(pos).long()
-        high = torch.ceil(pos).long()
         
-        # Calculate weights
+        # Force low and high to be adjacent integers to prevent overwriting
+        low = torch.clamp(torch.floor(pos).long(), 0, self.num_bins - 2)
+        high = low + 1
+        
+        # Calculate weights based on the original pos relative to low
         weight_high = pos - low
         weight_low = 1.0 - weight_high
         
-        # Create the one-hot-like vector
+        # Create the target two-hot vector
         two_hot = torch.zeros(*x.shape, self.num_bins, device=self.device)
         two_hot.scatter_(-1, low.unsqueeze(-1), weight_low.unsqueeze(-1))
         two_hot.scatter_(-1, high.unsqueeze(-1), weight_high.unsqueeze(-1))
@@ -55,6 +58,22 @@ class TwoHotEncoding:
         """Logits to Expected Value (Equation 10)"""
         probs = torch.softmax(logits, dim=-1)
         return torch.sum(probs * self.bin_values, dim=-1, keepdim=True)
+
+
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(1, channels), # LayerNorm equivalent for images
+            nn.ELU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(1, channels)
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
 
 
 class GoalEncoder(nn.Module):
@@ -198,203 +217,37 @@ class EnsembleRewardPredictor(nn.Module):
         return torch.stack([head(x) for head in self.heads], dim=0)
 
 
-class RandomCNNEncoder(nn.Module):
-    def __init__(self, out_dim=8):
-        super().__init__()
-        # Small CNN to extract spatial and visual patterns
-        self.conv1 = nn.Conv2d(3, 8, kernel_size=5, stride=2, padding=2, bias=False) # 64x64 -> 32x32
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=5, stride=2, padding=2, bias=False) # 32x32 -> 16x16
-        self.fc = nn.Linear(16 * 16 * 16, out_dim)
-        
-        # Initialize randomly and freeze
-        for param in self.parameters():
-            param.requires_grad = False
-            nn.init.normal_(param, mean=0.0, std=1.0)
-            
-    def forward(self, x):
-        # Expects x shape: [B, 3, 64, 64] or [3, 64, 64], float in [0.0, 1.0]
-        if x.dim() == 3:
-            x = x.unsqueeze(0)
-        with torch.no_grad():
-            x = F.relu(self.conv1(x))
-            x = F.relu(self.conv2(x))
-            x = x.view(x.size(0), -1)
-            out = torch.tanh(self.fc(x))
-        return out
-
-
-class RandomCNNEncoder(nn.Module):
-    def __init__(self, out_dim=8):
-        super().__init__()
-        self.conv1 = nn.Conv2d(3, 8, kernel_size=5, stride=2, padding=2, bias=False) # 64x64 -> 32x32
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=5, stride=2, padding=2, bias=False) # 32x32 -> 16x16
-        self.fc = nn.Linear(16 * 16 * 16, out_dim)
-        
-        for param in self.parameters():
-            param.requires_grad = False
-            nn.init.normal_(param, mean=0.0, std=1.0)
-            
-    def forward(self, x):
-        if x.dim() == 3:
-            x = x.unsqueeze(0)
-        with torch.no_grad():
-            x = F.relu(self.conv1(x))
-            x = F.relu(self.conv2(x))
-            x = x.view(x.size(0), -1)
-            out = torch.tanh(self.fc(x))
-        return out
-
-
 class Buffer(object):
-    def __init__(self, device, capacity=800000, actionSize=6, ram_dim=8, item_dim=2, team_level_dim=6, num_envs=4, block_size=128):  
+    def __init__(self, device, capacity=800000, actionSize=6, ram_dim=8, item_dim=2, team_level_dim=6, num_envs=4):  
         self.device = device
         self.capacity = capacity
         self.num_envs = num_envs
-        self.actionSize = actionSize
-        self.ram_dim = ram_dim
-        self.item_dim = item_dim
-        self.team_level_dim = team_level_dim
+        self.observations = torch.empty((capacity, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.uint8, device='cpu')
+        self.rams = torch.empty((capacity, ram_dim), dtype=torch.float32, device='cpu')
+        self.item_counts = torch.empty((capacity, item_dim), dtype=torch.float32, device='cpu')
+        self.team_levels = torch.empty((capacity, team_level_dim), dtype=torch.float32, device='cpu')
+        self.actions = torch.empty((capacity, actionSize), dtype=torch.float32, device='cpu')
+        self.rewards = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
         
-        self.block_size = block_size
-        self.num_blocks = capacity // block_size
-        self.capacity = self.num_blocks * block_size
-        
-        # Allocation
-        self.observations = torch.empty((self.capacity, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.uint8, device='cpu')
-        self.rams = torch.empty((self.capacity, ram_dim), dtype=torch.float32, device='cpu')
-        self.item_counts = torch.empty((self.capacity, item_dim), dtype=torch.float32, device='cpu')
-        self.team_levels = torch.empty((self.capacity, team_level_dim), dtype=torch.float32, device='cpu')
-        self.actions = torch.empty((self.capacity, actionSize), dtype=torch.float32, device='cpu')
-        self.rewards = torch.empty((self.capacity, 1), dtype=torch.float32, device='cpu')
-        
-        # Trajectory Signature Model (CPU-bound)
-        self.encoder = RandomCNNEncoder(out_dim=8).to('cpu')
-        self.signature_dim = 5 * 8 # 5 frames * 8 features
-        
-        # Dynamic Vector Database / Cluster Codebook
-        self.bucket_centroids = [] # List of unit-length PyTorch tensors of shape [signature_dim]
-        self.bucket_counts = []    # List of block counts per bucket
-        self.max_buckets = 512     # Hard cap to bound memory/computational scaling
-        self.similarity_threshold = 0.85 # Cosine similarity threshold to define a "new category"
-        
-        # Index Mapping: links each block index to its assigned bucket ID
-        self.block_bucket_ids = torch.full((self.num_blocks,), -1, dtype=torch.int32)
-        
-        # Buffer cursors
-        self.step_accumulator = []
-        self.block_index = 0
-        self.block_full = False
-
-    @property
-    def index(self):
-        return self.block_index * self.block_size
-
-    @property
-    def full(self):
-        return self.block_full
-
-    def _compute_trajectory_signature(self, step_accumulator):
-        # Sample 5 frames evenly spaced across the 128-step block
-        indices = [0, 31, 63, 95, 127]
-        feats = []
-        for idx in indices:
-            obs = step_accumulator[idx][0]
-            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device='cpu') / 255.0
-            with torch.no_grad():
-                feat = self.encoder(obs_tensor)
-            feats.append(feat)
-            
-        # Concatenate features into a joint trajectory signature [1, 40]
-        signature = torch.cat(feats, dim=1)
-        
-        # L2-normalize to compute Cosine Similarity via dot products
-        norm = torch.norm(signature, p=2, dim=1, keepdim=True) + 1e-8
-        return (signature / norm).squeeze(0)
-
-    def _find_or_create_bucket(self, signature):
-        # Base case: first block recorded
-        if len(self.bucket_centroids) == 0:
-            self.bucket_centroids.append(signature.clone())
-            self.bucket_counts.append(0) # Will be incremented on allocation
-            return 0
-            
-        # Stack existing bucket centroids: Shape [K, signature_dim]
-        centroids_matrix = torch.stack(self.bucket_centroids)
-        
-        # Compute Cosine Similarities: Shape [K]
-        similarities = torch.matmul(centroids_matrix, signature)
-        
-        max_sim, best_idx = torch.max(similarities, dim=0)
-        best_idx = best_idx.item()
-        
-        if max_sim >= self.similarity_threshold or len(self.bucket_centroids) >= self.max_buckets:
-            # Merge block into best-matching bucket and update centroid using running momentum
-            momentum = 0.95
-            updated_centroid = momentum * self.bucket_centroids[best_idx] + (1.0 - momentum) * signature
-            self.bucket_centroids[best_idx] = updated_centroid / (torch.norm(updated_centroid, p=2) + 1e-8)
-            return best_idx
-        else:
-            # Create a brand new trajectory bucket
-            new_idx = len(self.bucket_centroids)
-            self.bucket_centroids.append(signature.clone())
-            self.bucket_counts.append(0)
-            return new_idx
+        self.index = 0
+        self.full = False
 
     def add(self, observation, ram, item_count, team_level, action, reward):
-        self.step_accumulator.append((observation, ram, item_count, team_level, action, reward))
-        if len(self.step_accumulator) == self.block_size:
-            self._flush_accumulator()
+        self.observations[self.index] = torch.as_tensor(observation, dtype=torch.uint8)
+        self.rams[self.index] = torch.as_tensor(ram, dtype=torch.float32)
+        self.item_counts[self.index] = torch.as_tensor(item_count, dtype=torch.float32)
+        self.team_levels[self.index] = torch.as_tensor(team_level, dtype=torch.float32)
+        self.actions[self.index] = torch.as_tensor(action, dtype=torch.float32)
+        self.rewards[self.index] = torch.as_tensor(reward, dtype=torch.float32)
 
-    def _flush_accumulator(self):
-        # 1. First, compute the trajectory signature of the incoming sequence
-        signature = self._compute_trajectory_signature(self.step_accumulator)
-        
-        # 2. Determine where we are writing (always the oldest block, self.block_index)
-        write_block_idx = self.block_index
-        start_idx = write_block_idx * self.block_size
-        
-        # 3. If full, perform FIFO eviction on the old block at self.block_index
-        if self.block_full:
-            old_bucket_id = self.block_bucket_ids[write_block_idx].item()
-            if old_bucket_id != -1:
-                self.bucket_counts[old_bucket_id] -= 1
-                # If the bucket is now empty, remove it completely from the codebook
-                if self.bucket_counts[old_bucket_id] <= 0:
-                    self._prune_bucket(old_bucket_id)
-                    
-        # 4. Query/Update Vector Database (after the empty bucket cleanup is done)
-        bucket_id = self._find_or_create_bucket(signature)
-        
-        # 5. Write the new sequence data into the pre-allocated CPU tensors
-        for offset, t in enumerate(self.step_accumulator):
-            idx = start_idx + offset
-            self.observations[idx] = torch.as_tensor(t[0], dtype=torch.uint8)
-            self.rams[idx] = torch.as_tensor(t[1], dtype=torch.float32)
-            self.item_counts[idx] = torch.as_tensor(t[2], dtype=torch.float32)
-            self.team_levels[idx] = torch.as_tensor(t[3], dtype=torch.float32)
-            self.actions[idx] = torch.as_tensor(t[4], dtype=torch.float32)
-            self.rewards[idx] = torch.as_tensor(t[5], dtype=torch.float32)
-            
-        # 6. Assign the block's new bucket ID and update counts
-        self.block_bucket_ids[write_block_idx] = bucket_id
-        
-        # Ensure bucket_counts has space for the new bucket index
-        while len(self.bucket_counts) <= bucket_id:
-            self.bucket_counts.append(0)
-            
-        self.bucket_counts[bucket_id] += 1
-        
-        # 7. Advance the FIFO cursor index
-        self.block_index += 1
-        if self.block_index >= self.num_blocks:
-            self.block_full = True
-            self.block_index = 0
-            
-        self.step_accumulator.clear()
-
+        self.index = (self.index + 1) % self.capacity
+        self.full = self.full or (self.index == 0)
+    
     def sample(self, batchSize, sequenceSize):
-        valid_blocks = self.num_blocks if self.block_full else self.block_index
-        if valid_blocks == 0:
+        # Total valid elements in the buffer
+        N = self.capacity if self.full else self.index
+        
+        if N < sequenceSize:
             return None
 
         num_recent = int(round(batchSize * 0.25))
@@ -402,36 +255,38 @@ class Buffer(object):
 
         sample_indices = []
 
+        # 1. Sample from the recent window (20000 * num_envs steps)
         if num_recent > 0:
-            recent_window_size = min(200, valid_blocks)
-            if self.block_full:
-                block_starts = (self.block_index - torch.randint(1, recent_window_size + 1, (num_recent, 1))) % self.num_blocks
+            recent_window_size = 20000 * self.num_envs
+            effective_window = min(recent_window_size, N)
+            max_offset = effective_window - sequenceSize
+            
+            if max_offset >= 0:
+                # Sample offsets back from self.index
+                offsets = torch.randint(0, max_offset + 1, (num_recent, 1))
+                recent_starts = (self.index - sequenceSize - offsets) % self.capacity
+                seq_offsets = torch.arange(sequenceSize).reshape(1, -1)
+                recent_indices = (recent_starts + seq_offsets) % self.capacity
+                sample_indices.append(recent_indices)
             else:
-                block_starts = torch.randint(max(0, valid_blocks - recent_window_size), valid_blocks, (num_recent, 1))
-                
-            offsets = torch.randint(0, self.block_size - sequenceSize + 1, (num_recent, 1))
-            seq_offsets = torch.arange(sequenceSize).reshape(1, -1)
-            
-            recent_indices = block_starts * self.block_size + offsets + seq_offsets
-            sample_indices.append(recent_indices)
+                # Fallback to sampling everything from "all" if the recent window is too small
+                num_all += num_recent
+                num_recent = 0
 
-        # Rarity-Prioritized Sampling across dynamically generated vector buckets
+        # 2. Sample from all elements in the buffer
         if num_all > 0:
-            valid_bucket_ids = self.block_bucket_ids[:valid_blocks]
+            lastFilledIndex = self.index - sequenceSize + 1
+            limit = self.capacity if self.full else lastFilledIndex
             
-            counts_tensor = torch.tensor(self.bucket_counts, dtype=torch.float32)
-            counts = counts_tensor[valid_bucket_ids]
-            
-            weights = 1.0 / (torch.sqrt(counts) + 1e-5)
-            
-            block_starts = torch.multinomial(weights, num_all, replacement=True).reshape(-1, 1)
-            
-            offsets = torch.randint(0, self.block_size - sequenceSize + 1, (num_all, 1))
+            if limit <= 0:
+                return None
+
+            all_starts = torch.randint(0, limit, (num_all, 1))
             seq_offsets = torch.arange(sequenceSize).reshape(1, -1)
-            
-            all_indices = block_starts * self.block_size + offsets + seq_offsets
+            all_indices = (all_starts + seq_offsets) % self.capacity
             sample_indices.append(all_indices)
 
+        # Combine sampled indices
         sampleIndex = torch.cat(sample_indices, dim=0).long()
 
         obs_cpu = self.observations[sampleIndex]
@@ -449,175 +304,88 @@ class Buffer(object):
         return sample
 
     def save(self, path):
-        valid_limit = self.capacity if self.block_full else self.block_index * self.block_size
+        limit = self.capacity if self.full else self.index
         checkpoint = {
-            'observations': self.observations[:valid_limit].cpu(),
-            'rams': self.rams[:valid_limit].cpu(),
-            'item_counts': self.item_counts[:valid_limit].cpu(),
-            'team_levels': self.team_levels[:valid_limit].cpu(),
-            'actions': self.actions[:valid_limit].cpu(),
-            'rewards': self.rewards[:valid_limit].cpu(),
-            'bucket_centroids': [c.cpu() for c in self.bucket_centroids],
-            'bucket_counts': self.bucket_counts,
-            'block_bucket_ids': self.block_bucket_ids.cpu(),
-            'block_index': self.block_index,
-            'block_full': self.block_full,
-            'capacity': self.capacity,
-            'block_size': self.block_size
+            'observations': self.observations[:limit].cpu(),
+            'rams': self.rams[:limit].cpu(),
+            'item_counts': self.item_counts[:limit].cpu(),
+            'team_levels': self.team_levels[:limit].cpu(),
+            'actions': self.actions[:limit].cpu(),
+            'rewards': self.rewards[:limit].cpu(),
+            'index': self.index,
+            'full': self.full,
+            'capacity': self.capacity
         }
         torch.save(checkpoint, path)
 
     def load(self, path):
+        # Load directly to CPU
         checkpoint = torch.load(path, map_location='cpu')
         
-        if 'bucket_centroids' in checkpoint:
-            saved_obs = checkpoint['observations']
-            valid_limit = saved_obs.shape[0]
-            
-            self.observations[:valid_limit].copy_(saved_obs)
-            self.rams[:valid_limit].copy_(checkpoint['rams'])
-            self.item_counts[:valid_limit].copy_(checkpoint['item_counts'])
-            self.team_levels[:valid_limit].copy_(checkpoint['team_levels'])
-            self.actions[:valid_limit].copy_(checkpoint['actions'])
-            self.rewards[:valid_limit].copy_(checkpoint['rewards'])
-            
-            self.bucket_centroids = checkpoint['bucket_centroids']
-            self.bucket_counts = checkpoint['bucket_counts']
-            self.block_bucket_ids.copy_(checkpoint['block_bucket_ids'])
-            self.block_index = checkpoint['block_index']
-            self.block_full = checkpoint['block_full']
-            
-            print(f"[*] Loaded Dynamic Trajectory Codebook Buffer: {valid_limit // self.block_size} blocks across {len(self.bucket_centroids)} unique buckets.")
+        saved_obs = checkpoint['observations']
+        saved_rams = checkpoint['rams']
+        saved_item_counts = checkpoint.get('item_counts', torch.zeros((saved_obs.shape[0], 2), dtype=torch.float32))
+        saved_team_levels = checkpoint.get('team_levels', torch.zeros((saved_obs.shape[0], 6), dtype=torch.float32))
+        saved_actions = checkpoint['actions']
+        saved_rewards = checkpoint['rewards']
+        
+        old_index = checkpoint['index']
+        old_full = checkpoint['full']
+        old_capacity = saved_obs.shape[0]
+
+        # Unroll the saved buffer so it is chronologically ordered (Oldest -> Newest)
+        if old_full:
+            # The buffer wrapped around. The oldest data is from old_index to the end.
+            obs_ordered = torch.cat((saved_obs[old_index:], saved_obs[:old_index]), dim=0)
+            rams_ordered = torch.cat((saved_rams[old_index:], saved_rams[:old_index]), dim=0)
+            item_ordered = torch.cat((saved_item_counts[old_index:], saved_item_counts[:old_index]), dim=0)
+            team_ordered = torch.cat((saved_team_levels[old_index:], saved_team_levels[:old_index]), dim=0)
+            actions_ordered = torch.cat((saved_actions[old_index:], saved_actions[:old_index]), dim=0)
+            rewards_ordered = torch.cat((saved_rewards[old_index:], saved_rewards[:old_index]), dim=0)
+            total_valid = old_capacity
         else:
-            # Fallback parsing legacy checkpoints: rebuild codebook centroids on the fly
-            saved_obs = checkpoint['observations']
-            saved_rams = checkpoint['rams']
-            saved_item_counts = checkpoint.get('item_counts', torch.zeros((saved_obs.shape[0], 2), dtype=torch.float32))
-            saved_team_levels = checkpoint.get('team_levels', torch.zeros((saved_obs.shape[0], 6), dtype=torch.float32))
-            saved_actions = checkpoint['actions']
-            saved_rewards = checkpoint['rewards']
-            
-            old_index = checkpoint['index']
-            old_full = checkpoint['full']
-            old_capacity = saved_obs.shape[0]
+            # Buffer never wrapped around, already chronological
+            obs_ordered = saved_obs[:old_index]
+            rams_ordered = saved_rams[:old_index]
+            item_ordered = saved_item_counts[:old_index]
+            team_ordered = saved_team_levels[:old_index]
+            actions_ordered = saved_actions[:old_index]
+            rewards_ordered = saved_rewards[:old_index]
+            total_valid = old_index
 
-            if old_full:
-                obs_ordered = torch.cat((saved_obs[old_index:], saved_obs[:old_index]), dim=0)
-                rams_ordered = torch.cat((saved_rams[old_index:], saved_rams[:old_index]), dim=0)
-                item_ordered = torch.cat((saved_item_counts[old_index:], saved_item_counts[:old_index]), dim=0)
-                team_ordered = torch.cat((saved_team_levels[old_index:], saved_team_levels[:old_index]), dim=0)
-                actions_ordered = torch.cat((saved_actions[old_index:], saved_actions[:old_index]), dim=0)
-                rewards_ordered = torch.cat((saved_rewards[old_index:], saved_rewards[:old_index]), dim=0)
-                total_valid = old_capacity
-            else:
-                obs_ordered = saved_obs[:old_index]
-                rams_ordered = saved_rams[:old_index]
-                item_ordered = saved_item_counts[:old_index]
-                team_ordered = saved_team_levels[:old_index]
-                actions_ordered = saved_actions[:old_index]
-                rewards_ordered = saved_rewards[:old_index]
-                total_valid = old_index
+        # Handle the edge case if the new buffer is somehow SMALLER than the old valid data
+        if total_valid > self.capacity:
+            obs_ordered = obs_ordered[-self.capacity:]
+            rams_ordered = rams_ordered[-self.capacity:]
+            item_ordered = item_ordered[-self.capacity:]
+            team_ordered = team_ordered[-self.capacity:]
+            actions_ordered = actions_ordered[-self.capacity:]
+            rewards_ordered = rewards_ordered[-self.capacity:]
+            total_valid = self.capacity
 
-            num_importable_blocks = min(total_valid // self.block_size, self.num_blocks)
-            for b in range(num_importable_blocks):
-                start = b * self.block_size
-                end = start + self.block_size
-                
-                self.observations[start:end].copy_(obs_ordered[start:end])
-                self.rams[start:end].copy_(rams_ordered[start:end])
-                self.item_counts[start:end].copy_(item_ordered[start:end])
-                self.team_levels[start:end].copy_(team_ordered[start:end])
-                self.actions[start:end].copy_(actions_ordered[start:end])
-                self.rewards[start:end].copy_(rewards_ordered[start:end])
-                
-                # Reconstruct temporary block accumulator for signature generation
-                temp_accum = []
-                for step_idx in range(start, end):
-                    temp_accum.append((self.observations[step_idx], self.rams[step_idx], self.item_counts[step_idx], self.team_levels[step_idx], self.actions[step_idx], self.rewards[step_idx]))
-                
-                signature = self._compute_trajectory_signature(temp_accum)
-                bucket_id = self._find_or_create_bucket(signature)
-                self.block_bucket_ids[b] = bucket_id
-                self.bucket_counts[bucket_id] += 1
-                
-            self.block_index = num_importable_blocks % self.num_blocks
-            self.block_full = (num_importable_blocks == self.num_blocks)
-            print(f"[*] Reconstructed codebook from flat checkpoint: {num_importable_blocks} blocks mapped to {len(self.bucket_centroids)} visual categories.")
-    
+        # Copy the ordered data into the beginning of our new buffer
+        self.observations[:total_valid].copy_(obs_ordered)
+        self.rams[:total_valid].copy_(rams_ordered)
+        self.item_counts[:total_valid].copy_(item_ordered)
+        self.team_levels[:total_valid].copy_(team_ordered)
+        self.actions[:total_valid].copy_(actions_ordered)
+        self.rewards[:total_valid].copy_(rewards_ordered)
+
+        self.index = total_valid % self.capacity
+        self.full = (total_valid == self.capacity)
+        print(f"[*] Buffer Resized/Loaded: {total_valid} elements loaded. New capacity: {self.capacity}")
+
     def print_diagnostics(self):
-        """Displays visual cluster distribution, buffer density, and rare state preservation metrics."""
-        valid_blocks = self.num_blocks if self.block_full else self.block_index
-        total_steps = valid_blocks * self.block_size
-        capacity_pct = (valid_blocks / self.num_blocks) * 100
-        
-        num_buckets = len(self.bucket_centroids)
-        if num_buckets == 0:
-            print("\n" + "="*60)
-            print("  [Buffer Diagnostics] Replay Buffer is currently EMPTY.")
-            print("="*60 + "\n")
-            return
-            
-        counts_tensor = torch.tensor(self.bucket_counts, dtype=torch.float32)
-        
-        # Calculate cluster density statistics
-        total_assigned_blocks = int(counts_tensor.sum().item())
-        avg_blocks_per_bucket = counts_tensor.mean().item()
-        
-        # Count empty and active buckets
-        non_empty_buckets = int((counts_tensor > 0).sum().item())
-        empty_buckets = num_buckets - non_empty_buckets
-        
-        # Sort bucket sizes
-        sorted_counts, sorted_indices = torch.sort(counts_tensor, descending=True)
-        
-        print("\n" + "="*60)
-        print("          DIVERSITY-BALANCED REPLAY BUFFER DIAGNOSTICS")
-        print("="*60)
-        print(f"  Buffer Fill Ratio       : {total_steps:,} / {self.capacity:,} steps ({capacity_pct:.2f}%)")
-        print(f"  Stored Blocks           : {valid_blocks:,} / {self.num_blocks:,} blocks")
-        print(f"  Active Vector Buckets   : {num_buckets} / {self.max_buckets} categories")
-        print(f"  Populated Categories    : {non_empty_buckets} (Pruned/Empty: {empty_buckets})")
-        print(f"  Average Blocks/Category : {avg_blocks_per_bucket:.2f}")
-        print("-"*60)
-        
-        # Top 5 largest categories (visual sequences currently dominating the environment)
-        print("  Top 5 Largest Categories (Redundant visual states):")
-        top_k = min(5, num_buckets)
-        for i in range(top_k):
-            b_id = sorted_indices[i].item()
-            b_cnt = int(sorted_counts[i].item())
-            b_pct = (b_cnt / max(1, valid_blocks)) * 100
-            print(f"    - Category #{b_id:03d} : {b_cnt:4d} blocks ({b_pct:5.2f}% of buffer footprint)")
-            
-        print("-"*60)
-        
-        # Bottom 5 smallest active categories (visually unique states saved from eviction)
-        print("  Bottom 5 Smallest Active Categories (Rare/Protected states):")
-        active_indices = sorted_indices[sorted_counts > 0]
-        active_counts = sorted_counts[sorted_counts > 0]
-        bot_k = min(5, len(active_counts))
-        for i in range(bot_k):
-            idx_from_end = -(i + 1)
-            b_id = active_indices[idx_from_end].item()
-            b_cnt = int(active_counts[idx_from_end].item())
-            b_pct = (b_cnt / max(1, valid_blocks)) * 100
-            print(f"    - Category #{b_id:03d} : {b_cnt:4d} blocks ({b_pct:5.2f}% of buffer footprint)")
-            
-        print("="*60 + "\n")
-
-    def _prune_bucket(self, bucket_id):
-        # 1. Remove the empty centroid from our codebook
-        self.bucket_centroids.pop(bucket_id)
-        # 2. Remove the count tracker from our list
-        self.bucket_counts.pop(bucket_id)
-        
-        # 3. For any block that pointed to this deleted bucket, reset its index to -1
-        mask_same = (self.block_bucket_ids == bucket_id)
-        self.block_bucket_ids[mask_same] = -1
-        
-        # 4. Any block pointing to a bucket index greater than bucket_id shifts down by 1
-        mask_greater = (self.block_bucket_ids > bucket_id)
-        self.block_bucket_ids[mask_greater] -= 1
+        """Displays simple buffer metrics to maintain compatibility with policy.py"""
+        valid_limit = self.capacity if self.full else self.index
+        percentage = (valid_limit / self.capacity) * 100.0
+        print("\n" + "="*50)
+        print("          REPLAY BUFFER DIAGNOSTICS")
+        print("="*50)
+        print(f"  Buffer Fill Ratio : {valid_limit:,} / {self.capacity:,} steps ({percentage:.2f}%)")
+        print(f"  Active Environments : {self.num_envs}")
+        print(f"  Recent Sampling Window Size : {20000 * self.num_envs:,} steps")
+        print("="*50 + "\n")
 
 
 class RecurrentModel(nn.Module):
@@ -721,21 +489,6 @@ class RewardPredictor(nn.Module):
 
     def forward(self, x):
         return self.transform(x)
-
-
-class ResBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(1, channels), # LayerNorm equivalent for images
-            nn.ELU(),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(1, channels)
-        )
-
-    def forward(self, x):
-        return x + self.block(x)
 
 
 class EncoderImage(nn.Module):
@@ -868,7 +621,7 @@ class Dreamer:
         self.item_out_dim = 128
         self.enconder_output_size = 1024 + self.ram_out_dim + self.team_out_dim + self.item_out_dim
         
-        self.entropy_scale = 0.001
+        self.entropy_scale = 0.002
         self.seed = seed
         self.number_of_sequences = number_of_sequences 
         self.steps_per_sequence = steps_per_sequence
@@ -921,7 +674,8 @@ class Dreamer:
             actionSize=self.action_dim,
             ram_dim=ram_dim,
             item_dim=item_dim,
-            team_level_dim=team_dim
+            team_level_dim=team_dim,
+            num_envs=len(envs) 
         )
 
         # WorldModelParameters (Includes Curiosity Predictor)
@@ -934,11 +688,11 @@ class Dreamer:
             list(self.goal_encoder.parameters()) +    
             list(self.team_encoder.parameters()) +    
             list(self.item_encoder.parameters()) +    
-            list(self.projector.parameters()) + # Swapped from self.decoder
+            list(self.projector.parameters()) +
             list(self.goalPredictor.parameters()) +
             list(self.teamPredictor.parameters()) +
             list(self.itemPredictor.parameters()) +
-            list(self.curiosityPredictor.parameters())
+            list(self.curiosityPredictor.parameters() )
         )
 
         # Optimizers
@@ -1039,26 +793,26 @@ class Dreamer:
         
         bt_loss = invariance_loss + alpha * redundancy_loss
         scaled_bt_loss = beta_BT * bt_loss
-
-       # ----------------------------------------------------
-        # LATENT CURIOSITY TARGET (Cosine Distance)
         # ----------------------------------------------------
-        # Normalized step-wise cosine distance [0.0, 2.0]
-        k_unit = F.normalize(k, p=2, dim=-1)
-        e_unit = F.normalize(e, p=2, dim=-1)
-        step_bt_error = 1.0 - (k_unit * e_unit).sum(dim=-1)
-        step_bt_error = step_bt_error.view(self.number_of_sequences, self.steps_per_sequence - 1)
-
-
+        # DECODER RECONSTRUCTION CURIOSITY (Reconstruction Space)
+        # ----------------------------------------------------
         with torch.no_grad():
-            # Find the 20th percentile error in the batch to act as the explored baseline
-            baseline = torch.quantile(step_bt_error, 0.95)
+            detached_states = full_states.detach().view(-1, self.concatenated_dim)
+            recon_imgs = self.decoder(detached_states)
+            target_imgs = batch_data["observations"][:, 1:].flatten(0, 1)
             
-            # Subtract baseline and clamp to 0.0
-            rectified_error = torch.clamp(step_bt_error - baseline, min=0.0)
-            transformed_error = rectified_error * 0.2
+            # Step-wise reconstruction error (Mean Squared Error per image step)
+            step_recon_error = torch.mean((recon_imgs - target_imgs) ** 2, dim=[1, 2, 3])
+            
+            # Reshape to sequence structure [B, T-1] for tracking & percentile calculation
+            step_recon_error_seq = step_recon_error.view(self.number_of_sequences, self.steps_per_sequence - 1)
 
-        # Train Curiosity Predictor on transformed latent prediction error
+            # Percentile baseline system: zeroes all the lower errors and only keeps top 5%
+            baseline = torch.quantile(step_recon_error_seq, 0.95)
+            rectified_error = torch.clamp(step_recon_error_seq - baseline, min=0.0)
+            transformed_error = rectified_error * 0.1
+
+        # Train Curiosity Predictor on transformed reconstruction curiosity error
         pred_curiosity_logits = self.curiosityPredictor(full_states.detach())
         with torch.no_grad():
             target_curiosity = self.two_hot.encode(transformed_error.detach())
@@ -1134,8 +888,10 @@ class Dreamer:
             "team_loss": team_loss.item(),
             "item_loss": item_loss.item(),
             "curiosity_loss": curiosity_loss.item(),
+            "rnd_loss": 0.0,  # Legacy compatibility
             "decoder_loss": decoder_loss.item()
         }
+
 
         return full_states.view(-1, self.concatenated_dim).detach(), metrics
     
@@ -1208,13 +964,13 @@ class Dreamer:
         
         # Advantages
         denominator = self.dynamicDataNormalizer(lambda_values)
-        advantages = (lambda_values - online_values[:, :-1].detach()) / denominator
+        reward_advantages = (lambda_values - online_values[:, :-1].detach()) / denominator
         
         curiosity_denominator = self.curiosityDynamicDataNormalizer(curiosity_lambda_values)
         curiosity_advantages = (curiosity_lambda_values - online_curiosity_values[:, :-1].detach()) / curiosity_denominator
         
         # Combine extrinsic and intrinsic exploration advantages
-        combined_advantages = advantages  #+ self.curiosity_scale * curiosity_advantages
+        combined_advantages = reward_advantages  + self.curiosity_scale * curiosity_advantages
 
         # --- ACTOR LOSS ---
         actor_loss_per_step = combined_advantages.detach() * log_probabilities + self.entropy_scale * entropies
@@ -1299,7 +1055,7 @@ class Dreamer:
             "curiosity_critic_loss": curiosity_critic_loss.item(),
             "entropies": entropies.mean().item(),
             "log_probabilities": log_probabilities.mean().item(),
-            "advantages": advantages.mean().item(),
+            "reward_advantages": reward_advantages.mean().item(),
             "curiosity_advantages": curiosity_advantages.mean().item(),
             "critic_values": online_values.mean().item(), 
             "curiosity_critic_values": online_curiosity_values.mean().item(),
@@ -1484,7 +1240,6 @@ class Dreamer:
             'ema_curiosity_critic': self.ema_curiosity_critic.state_dict(),
             'dynamicDataNormalizer': self.dynamicDataNormalizer.state_dict(),
             'curiosityDynamicDataNormalizer': self.curiosityDynamicDataNormalizer.state_dict(),
-            # Independent Visualization Decoder
             'decoder': self.decoder.state_dict(),
             'decoderOptimizer': self.decoderOptimizer.state_dict(),
             
@@ -1547,7 +1302,7 @@ class Dreamer:
             self.itemPredictor.load_state_dict(checkpoint['itemPredictor'])
             self.dynamicDataNormalizer.load_state_dict(checkpoint['dynamicDataNormalizer'])
 
-            # Optional / Newly Added Curiosity Modules to keep older checkpoints loading smoothly
+            # Optional / Newly Added Curiosity Modules
             self.curiosityPredictor.load_state_dict(checkpoint['curiosityPredictor'])
             self.curiosity_critic.load_state_dict(checkpoint['curiosity_critic'])
             self.ema_curiosity_critic.load_state_dict(checkpoint['ema_curiosity_critic'])
@@ -1558,8 +1313,12 @@ class Dreamer:
             if 'decoderOptimizer' in checkpoint:
                 self.decoderOptimizer.load_state_dict(checkpoint['decoderOptimizer'])
 
-            # Load Optimizers
-            self.worldModelOptimizer.load_state_dict(checkpoint['worldModelOptimizer'])
+            # --- Legacy Decoder RND parameters skipped (switched to reconstruction curiosity) ---
+            if 'rnd_state_dict' in checkpoint:
+                print("[*] Found 'rnd_state_dict' in checkpoint. Safely skipping it as RND is replaced by reconstruction curiosity.")
+            
+            
+            #self.worldModelOptimizer.load_state_dict(checkpoint['worldModelOptimizer'])
             self.actorOptimizer.load_state_dict(checkpoint['actorOptimizer'])
             self.criticOptimizer.load_state_dict(checkpoint['criticOptimizer'])
             self.curiosityCriticOptimizer.load_state_dict(checkpoint['curiosityCriticOptimizer'])
