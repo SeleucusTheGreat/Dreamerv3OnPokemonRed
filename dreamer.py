@@ -631,6 +631,9 @@ class Dreamer:
         self.curiosity_scale = curiosity_scale
         self.envs = envs 
         self.scaler = torch.amp.GradScaler('cuda')
+        self.kl_diff_decay = 0.99
+        self.kl_diff_ema = torch.zeros((), dtype=torch.float32, device=self.device)
+
 
         # Models
         self.two_hot = TwoHotEncoding(device=self.device)
@@ -794,23 +797,31 @@ class Dreamer:
         bt_loss = invariance_loss + alpha * redundancy_loss
         scaled_bt_loss = beta_BT * bt_loss
         # ----------------------------------------------------
-        # DECODER RECONSTRUCTION CURIOSITY (Reconstruction Space)
+        # LATENT DIFFERENCE CURIOSITY
         # ----------------------------------------------------
         with torch.no_grad():
-            detached_states = full_states.detach().view(-1, self.concatenated_dim)
-            recon_imgs = self.decoder(detached_states)
-            target_imgs = batch_data["observations"][:, 1:].flatten(0, 1)
+            post_dist = Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1)
+            prior_dist = Independent(OneHotCategoricalStraightThrough(logits=priors_logits.detach()), 1)
             
-            # Step-wise reconstruction error (Mean Squared Error per image step)
-            step_recon_error = torch.mean((recon_imgs - target_imgs) ** 2, dim=[1, 2, 3])
+            # Calculate the step-wise KL divergence between posterior and prior: shape [B, T-1]
+            kl_diff = kl_divergence(post_dist, prior_dist)
             
-            # Reshape to sequence structure [B, T-1] for tracking & percentile calculation
-            step_recon_error_seq = step_recon_error.view(self.number_of_sequences, self.steps_per_sequence - 1)
-
-            # Percentile baseline system: zeroes all the lower errors and only keeps top 5%
-            baseline = torch.quantile(step_recon_error_seq, 0.95)
-            rectified_error = torch.clamp(step_recon_error_seq - baseline, min=0.0)
-            transformed_error = rectified_error * 0.1
+            # Update the exponential moving average of the KL difference
+            batch_mean = kl_diff.mean().detach()
+            if self.kl_diff_ema.item() == 0.0:
+                self.kl_diff_ema.copy_(batch_mean)
+            else:
+                self.kl_diff_ema.copy_(self.kl_diff_decay * self.kl_diff_ema + (1.0 - self.kl_diff_decay) * batch_mean)
+            
+            # Subtract EMA baseline (clamp at 0.0)
+            kl_diff_rectified = torch.clamp(kl_diff - self.kl_diff_ema, min=0.0)
+            
+            # Percentile baseline system: only keep the top 5% (95th percentile)
+            baseline = torch.quantile(kl_diff_rectified, 0.95)
+            
+            # Keep values where kl_diff_rectified >= baseline, and set the rest to 0
+            rectified_error = torch.where(kl_diff_rectified >= baseline, kl_diff_rectified, torch.zeros_like(kl_diff_rectified))
+            transformed_error = rectified_error
 
         # Train Curiosity Predictor on transformed reconstruction curiosity error
         pred_curiosity_logits = self.curiosityPredictor(full_states.detach())
@@ -970,7 +981,7 @@ class Dreamer:
         curiosity_advantages = (curiosity_lambda_values - online_curiosity_values[:, :-1].detach()) / curiosity_denominator
         
         # Combine extrinsic and intrinsic exploration advantages
-        combined_advantages = reward_advantages  + self.curiosity_scale * curiosity_advantages
+        combined_advantages = reward_advantages # + self.curiosity_scale * curiosity_advantages
 
         # --- ACTOR LOSS ---
         actor_loss_per_step = combined_advantages.detach() * log_probabilities + self.entropy_scale * entropies
@@ -1253,6 +1264,7 @@ class Dreamer:
             'total_num_episodes': self.total_num_episodes,
             'total_num_steps': self.total_num_steps,
             'total_num_updates': self.total_num_updates,
+            'kl_diff_ema': self.kl_diff_ema,
         }
         
         torch.save(checkpoint, path)
@@ -1302,21 +1314,15 @@ class Dreamer:
             self.itemPredictor.load_state_dict(checkpoint['itemPredictor'])
             self.dynamicDataNormalizer.load_state_dict(checkpoint['dynamicDataNormalizer'])
 
-            # Optional / Newly Added Curiosity Modules
-            self.curiosityPredictor.load_state_dict(checkpoint['curiosityPredictor'])
-            self.curiosity_critic.load_state_dict(checkpoint['curiosity_critic'])
-            self.ema_curiosity_critic.load_state_dict(checkpoint['ema_curiosity_critic'])
-            self.curiosityDynamicDataNormalizer.load_state_dict(checkpoint['curiosityDynamicDataNormalizer'])
+            # Curiosity
+            #self.curiosityPredictor.load_state_dict(checkpoint['curiosityPredictor'])
+            #self.curiosity_critic.load_state_dict(checkpoint['curiosity_critic'])
+            #self.ema_curiosity_critic.load_state_dict(checkpoint['ema_curiosity_critic'])
+            #self.curiosityDynamicDataNormalizer.load_state_dict(checkpoint['curiosityDynamicDataNormalizer'])
 
-            if 'decoder' in checkpoint:
-                self.decoder.load_state_dict(checkpoint['decoder'])
-            if 'decoderOptimizer' in checkpoint:
-                self.decoderOptimizer.load_state_dict(checkpoint['decoderOptimizer'])
-
-            # --- Legacy Decoder RND parameters skipped (switched to reconstruction curiosity) ---
-            if 'rnd_state_dict' in checkpoint:
-                print("[*] Found 'rnd_state_dict' in checkpoint. Safely skipping it as RND is replaced by reconstruction curiosity.")
-            
+            # Decoder for visualization
+            self.decoder.load_state_dict(checkpoint['decoder'])
+            self.decoderOptimizer.load_state_dict(checkpoint['decoderOptimizer'])   
             
             #self.worldModelOptimizer.load_state_dict(checkpoint['worldModelOptimizer'])
             self.actorOptimizer.load_state_dict(checkpoint['actorOptimizer'])
@@ -1327,6 +1333,7 @@ class Dreamer:
             self.total_num_episodes = checkpoint.get('total_num_episodes', 0)
             self.total_num_steps = checkpoint.get('total_num_steps', 0)
             self.total_num_updates = checkpoint.get('total_num_updates', 0)
+            self.kl_diff_ema = checkpoint.get('kl_diff_ema', torch.zeros((), dtype=torch.float32, device=self.device)).to(self.device)
             
             print(f"Loaded weights and progress ({self.total_num_updates} updates) from: {path}")
 
