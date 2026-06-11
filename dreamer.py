@@ -1128,7 +1128,7 @@ class Dreamer:
             for param, ema_param in zip(self.curiosity_critic.parameters(), self.ema_curiosity_critic.parameters()):
                 ema_param.data.copy_(self.critic_ema_decay * ema_param.data + (1.0 - self.critic_ema_decay) * param.data)
 
-        # --- METRICS COLLECTION ---
+
         metrics = {
             "actor_loss": actor_loss.item(),
             "critic_loss": critic_loss.item(),
@@ -1166,11 +1166,11 @@ class Dreamer:
             "Random"
         )
         
-        # Track the trajectory with the highest predicted curiosity
+
         trajectory_curiosity = predicted_curiosity.sum(dim=1)
         cur_dream_idx = torch.argmax(trajectory_curiosity).item()
         cur_dream_data = (
-            trajectory_curiosity[cur_dream_idx].item(), # Using total curiosity as the sorting metric
+            trajectory_curiosity[cur_dream_idx].item(), 
             full_states[cur_dream_idx].detach().cpu(),
             predicted_rewards[cur_dream_idx].detach().cpu(),
             lambda_values[cur_dream_idx].detach().cpu(),       
@@ -1243,8 +1243,8 @@ class Dreamer:
                     local_buffers[i].append((
                         observations[i].copy(), 
                         rams[i].copy(), 
-                        item_counts[i].copy(),   # Moved here (size 2)
-                        team_levels[i].copy(),   # Moved here (size 6)
+                        item_counts[i].copy(),  
+                        team_levels[i].copy(),  
                         actions_for_buffer[i].copy(), 
                         reward
                     ))
