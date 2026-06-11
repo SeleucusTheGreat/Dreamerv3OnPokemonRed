@@ -25,7 +25,7 @@ class Policy(nn.Module):
         self.seed = 1234
         self.number_of_sequences = 64 # Batch size
         self.steps_per_sequence = 64
-        self.curiosity_scale = 1  
+        self.curiosity_scale = 0.1  
         
         self.seedMeDaddy(self.seed)
 

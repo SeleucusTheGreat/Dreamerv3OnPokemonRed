@@ -89,6 +89,32 @@ class GoalEncoder(nn.Module):
 
     def forward(self, ram):
         return self.net(ram)
+    
+class LinearTwoHotEncoding:
+    def __init__(self, min_val=0.0, max_val=5.0, num_bins=255, device="cuda"):
+        self.device = device
+        self.num_bins = num_bins
+        self.min_val = min_val
+        self.max_val = max_val
+        self.bins = torch.linspace(min_val, max_val, num_bins, device=device)
+        self.bin_values = self.bins  # Purely linear scale, no symexp
+
+    def encode(self, x):
+        x = torch.clamp(x, self.min_val, self.max_val)
+        pos = (x - self.min_val) / (self.bins[1] - self.bins[0])
+        low = torch.clamp(torch.floor(pos).long(), 0, self.num_bins - 2)
+        high = low + 1
+        weight_high = pos - low
+        weight_low = 1.0 - weight_high
+        
+        two_hot = torch.zeros(*x.shape, self.num_bins, device=self.device)
+        two_hot.scatter_(-1, low.unsqueeze(-1), weight_low.unsqueeze(-1))
+        two_hot.scatter_(-1, high.unsqueeze(-1), weight_high.unsqueeze(-1))
+        return two_hot
+
+    def decode(self, logits):
+        probs = torch.softmax(logits, dim=-1)
+        return torch.sum(probs * self.bin_values, dim=-1, keepdim=True)
 
 
 class GoalPredictor(nn.Module):
@@ -646,6 +672,9 @@ class Dreamer:
         self.actor = Actor(self.action_dim, self.device, self.concatenated_dim).to(self.device)
         self.decoder = Decoder(input_size=self.concatenated_dim).to(self.device)
         self.decoderOptimizer = torch.optim.Adam(self.decoder.parameters(), lr=2e-4)
+        self.curiosity_two_hot = LinearTwoHotEncoding(min_val=0.0, max_val=5.0, num_bins=255, device=self.device)
+        self.kl_mean = torch.zeros((), dtype=torch.float32, device=self.device)
+        self.kl_std = torch.ones((), dtype=torch.float32, device=self.device)
         
         # Reward Critic
         self.critic = Critic(self.concatenated_dim).to(self.device)
@@ -797,36 +826,39 @@ class Dreamer:
         bt_loss = invariance_loss + alpha * redundancy_loss
         scaled_bt_loss = beta_BT * bt_loss
         # ----------------------------------------------------
-        # LATENT DIFFERENCE CURIOSITY
+        # LATENT DIFFERENCE CURIOSITY (UPDATED)
         # ----------------------------------------------------
         with torch.no_grad():
             post_dist = Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1)
             prior_dist = Independent(OneHotCategoricalStraightThrough(logits=priors_logits.detach()), 1)
             
-            # Calculate the step-wise KL divergence between posterior and prior: shape [B, T-1]
+            # Step-wise KL divergence between posterior and prior: shape [B, T-1]
             kl_diff = kl_divergence(post_dist, prior_dist)
             
-            # Update the exponential moving average of the KL difference
+            # Compute batch statistics
             batch_mean = kl_diff.mean().detach()
-            if self.kl_diff_ema.item() == 0.0:
-                self.kl_diff_ema.copy_(batch_mean)
+            batch_std = kl_diff.std().detach()
+            
+            # Update running global mean & standard deviation indicators
+            if self.kl_mean.item() == 0.0:
+                self.kl_mean.copy_(batch_mean)
+                self.kl_std.copy_(batch_std + 1e-6)
             else:
-                self.kl_diff_ema.copy_(self.kl_diff_decay * self.kl_diff_ema + (1.0 - self.kl_diff_decay) * batch_mean)
+                decay = 0.99
+                self.kl_mean.copy_(decay * self.kl_mean + (1.0 - decay) * batch_mean)
+                self.kl_std.copy_(decay * self.kl_std + (1.0 - decay) * (batch_std + 1e-6))
             
-            # Subtract EMA baseline (clamp at 0.0)
-            kl_diff_rectified = torch.clamp(kl_diff - self.kl_diff_ema, min=0.0)
-            
-            # Percentile baseline system: only keep the top 5% (95th percentile)
-            baseline = torch.quantile(kl_diff_rectified, 0.95)
-            
-            # Keep values where kl_diff_rectified >= baseline, and set the rest to 0
-            rectified_error = torch.where(kl_diff_rectified >= baseline, kl_diff_rectified, torch.zeros_like(kl_diff_rectified))
+            # Establish threshold based on global running distribution (Mean + 1.5 * Std)
+            # This isolates true exploration novelty and leaves familiar states at exactly 0.0
+            threshold = self.kl_mean + 2 * self.kl_std
+            rectified_error = torch.clamp(kl_diff - threshold, min=0.0)
             transformed_error = rectified_error
 
-        # Train Curiosity Predictor on transformed reconstruction curiosity error
+        # Train Curiosity Predictor on transformed linear error
         pred_curiosity_logits = self.curiosityPredictor(full_states.detach())
         with torch.no_grad():
-            target_curiosity = self.two_hot.encode(transformed_error.detach())
+            # Use dedicated linear encoder
+            target_curiosity = self.curiosity_two_hot.encode(transformed_error.detach())
             
         curiosity_loss = -torch.mean(torch.sum(target_curiosity * torch.log_softmax(pred_curiosity_logits, dim=-1), dim=-1)) * 100.0
 
@@ -955,7 +987,11 @@ class Dreamer:
         # Predict curiosity values for imagined steps
         with torch.no_grad():
             curiosity_logits = self.curiosityPredictor(imagined_steps)
-            predicted_curiosity = self.two_hot.decode(curiosity_logits).squeeze(-1) # [B, H]
+            # Use linear non-negative decoder
+            predicted_curiosity = self.curiosity_two_hot.decode(curiosity_logits).squeeze(-1) # [B, H]
+            
+            # Noise-Gate Filter: clamp negligible background noise to absolute zero
+            predicted_curiosity = torch.where(predicted_curiosity > 0.05, predicted_curiosity, torch.zeros_like(predicted_curiosity))
 
         imagined_states = full_states.detach()
         
@@ -981,7 +1017,7 @@ class Dreamer:
         curiosity_advantages = (curiosity_lambda_values - online_curiosity_values[:, :-1].detach()) / curiosity_denominator
         
         # Combine extrinsic and intrinsic exploration advantages
-        combined_advantages = reward_advantages # + self.curiosity_scale * curiosity_advantages
+        combined_advantages = reward_advantages  + self.curiosity_scale * curiosity_advantages
 
         # --- ACTOR LOSS ---
         actor_loss_per_step = combined_advantages.detach() * log_probabilities + self.entropy_scale * entropies
@@ -1253,6 +1289,8 @@ class Dreamer:
             'curiosityDynamicDataNormalizer': self.curiosityDynamicDataNormalizer.state_dict(),
             'decoder': self.decoder.state_dict(),
             'decoderOptimizer': self.decoderOptimizer.state_dict(),
+            'kl_mean': self.kl_mean,
+            'kl_std': self.kl_std,
             
             # Optimizers
             'worldModelOptimizer': self.worldModelOptimizer.state_dict(),
@@ -1315,10 +1353,10 @@ class Dreamer:
             self.dynamicDataNormalizer.load_state_dict(checkpoint['dynamicDataNormalizer'])
 
             # Curiosity
-            #self.curiosityPredictor.load_state_dict(checkpoint['curiosityPredictor'])
-            #self.curiosity_critic.load_state_dict(checkpoint['curiosity_critic'])
-            #self.ema_curiosity_critic.load_state_dict(checkpoint['ema_curiosity_critic'])
-            #self.curiosityDynamicDataNormalizer.load_state_dict(checkpoint['curiosityDynamicDataNormalizer'])
+            self.curiosityPredictor.load_state_dict(checkpoint['curiosityPredictor'])
+            self.curiosity_critic.load_state_dict(checkpoint['curiosity_critic'])
+            self.ema_curiosity_critic.load_state_dict(checkpoint['ema_curiosity_critic'])
+            self.curiosityDynamicDataNormalizer.load_state_dict(checkpoint['curiosityDynamicDataNormalizer'])
 
             # Decoder for visualization
             self.decoder.load_state_dict(checkpoint['decoder'])
@@ -1334,6 +1372,16 @@ class Dreamer:
             self.total_num_steps = checkpoint.get('total_num_steps', 0)
             self.total_num_updates = checkpoint.get('total_num_updates', 0)
             self.kl_diff_ema = checkpoint.get('kl_diff_ema', torch.zeros((), dtype=torch.float32, device=self.device)).to(self.device)
+
+
+            if 'kl_mean' in checkpoint and 'kl_std' in checkpoint:
+                self.kl_mean = checkpoint['kl_mean'].to(self.device)
+                self.kl_std = checkpoint['kl_std'].to(self.device)
+                print("[*] Loaded global curiosity statistics from checkpoint.")
+            else:
+                self.kl_mean = torch.zeros((), dtype=torch.float32, device=self.device)
+                self.kl_std = torch.ones((), dtype=torch.float32, device=self.device)
+                print("[*] Curiosity keys absent in checkpoint; initialized defaults from scratch.")
             
             print(f"Loaded weights and progress ({self.total_num_updates} updates) from: {path}")
 
@@ -1353,7 +1401,8 @@ class Dreamer:
     def visualize_single_dream(self, best_states, best_rewards, best_values, best_actions, best_advantages=None, title_prefix="Dream"):
         # Calculate predicted curiosities for each imagined state step
         curiosity_logits = self.curiosityPredictor(best_states.to(self.device))
-        curiosities = self.two_hot.decode(curiosity_logits).squeeze(-1).cpu()
+        # Use linear non-negative decoder
+        curiosities = self.curiosity_two_hot.decode(curiosity_logits).squeeze(-1).cpu()
 
         # Reconstruct state frames using our detached decoder
         decoded_imgs = self.decoder(best_states.to(self.device)).clamp(0.0, 1.0).cpu() # [horizon, 3, 64, 64]
