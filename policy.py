@@ -25,7 +25,7 @@ class Policy(nn.Module):
         self.seed = 1234
         self.number_of_sequences = 64 # Batch size
         self.steps_per_sequence = 64
-        self.curiosity_scale = 1
+        self.curiosity_scale = 0.1
         
         self.seedMeDaddy(self.seed)
 
@@ -50,6 +50,10 @@ class Policy(nn.Module):
 
     def train(self):
         self.dreamer.loadCheckpoints()
+        RESET_RND_STATS_ON_RESUME = False
+        if RESET_RND_STATS_ON_RESUME:
+            self.dreamer.reset_rnd_stats()
+
         csv_filename = "pokemon_training_metrics.csv"
         
         headers =[
@@ -102,9 +106,11 @@ class Policy(nn.Module):
                 )
                 
                 # Update Networks
-                full_states, wm_metrics = self.dreamer.TrainWorldModel(sample)
-                # Catch all three dreams
-                dream_metrics, best_dream, rand_dream, cur_dream = self.dreamer.Dream(full_states, batch_data=sample)
+                full_states, dream_priorities, wm_metrics = self.dreamer.TrainWorldModel(sample)
+                # Catch all three dreams (dream starts are partially prioritized by RND novelty)
+                dream_metrics, best_dream, rand_dream, cur_dream = self.dreamer.Dream(
+                    full_states, batch_data=sample, dream_priorities=dream_priorities
+                )
                 
                 best_dreams_of_episode.append(best_dream)
                 random_dreams_of_episode.append(rand_dream)
@@ -161,6 +167,8 @@ class Policy(nn.Module):
             print(f"    > Gradient Steps  : {self.dreamer.total_num_updates}")
             print(f"    > Total Reward    : {avg_score:.2f}")
             print(f"    > Actor Entropy   : {dream_metrics.get('entropies', 0):.4f}")
+            print(f"    > Novel frac (replay): {wm_metrics.get('rnd_novel_fraction', 0):.4f} | Novel frac (dream): {dream_metrics.get('dream_novel_fraction', 0):.4f}")
+            print(f"    > Mean dream curiosity: {dream_metrics.get('dream_mean_curiosity', 0):.4f} | RND mean err: {wm_metrics.get('rnd_mean', 0):.6f}")
 
             # --- CSV Logging ---
             row_data =[

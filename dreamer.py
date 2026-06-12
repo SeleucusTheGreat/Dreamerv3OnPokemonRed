@@ -198,23 +198,30 @@ class CuriosityPredictor(nn.Module):
             nn.SiLU(),
             nn.Linear(1024, num_bins)
         )
-        # Initialize final layer near zero for a stable initial categorical distribution
+        # Initialize final layer near zero for a stable initial categorical distribution.
+        # NOTE: with linear non-negative bins [0, 5], a uniform softmax decodes to 2.5 (the bin mean),
+        # not 0. We bias the first bin so the initial / out-of-distribution output decodes near 0.
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
+        with torch.no_grad():
+            self.net[-1].bias[0] = 10.0
 
     def forward(self, x):
         return self.net(x)
 
 
 class RNDTarget(nn.Module):
-    def __init__(self, input_size=768, output_size=512):
+    def __init__(self, in_channels=3, output_size=512, **kwargs):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_size, 1024),
-            nn.SiLU(),
-            nn.Linear(1024, 1024),
-            nn.SiLU(),
-            nn.Linear(1024, output_size)
+            nn.Conv2d(in_channels, 32, kernel_size=4, stride=2, padding=1), # 64x64 -> 32x32
+            nn.ELU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1), # 32x32 -> 16x16
+            nn.ELU(),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1), # 16x16 -> 8x8
+            nn.ELU(),
+            nn.Flatten(),
+            nn.Linear(128 * 8 * 8, output_size)
         )
         # Randomly initialized and frozen parameters
         for p in self.parameters():
@@ -225,14 +232,21 @@ class RNDTarget(nn.Module):
 
 
 class RNDPredictor(nn.Module):
-    def __init__(self, input_size=768, output_size=512):
+    def __init__(self, in_channels=3, output_size=512, **kwargs):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_size, 1024),
-            nn.SiLU(),
-            nn.Linear(1024, 1024),
-            nn.SiLU(),
-            nn.Linear(1024, output_size)
+            nn.Conv2d(in_channels, 32, kernel_size=4, stride=2, padding=1), # 64x64 -> 32x32
+            nn.ELU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1), # 32x32 -> 16x16
+            nn.ELU(),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1), # 16x16 -> 8x8
+            nn.ELU(),
+            nn.Flatten(),
+            nn.Linear(128 * 8 * 8, 512),
+            nn.ELU(),
+            nn.Linear(512, 512),
+            nn.ELU(),
+            nn.Linear(512, output_size)
         )
 
     def forward(self, x):
@@ -701,8 +715,8 @@ class Dreamer:
         self.curiosity_two_hot = LinearTwoHotEncoding(min_val=0.0, max_val=5.0, num_bins=255, device=self.device)
         
         # RND Networks and Statistics
-        self.rnd_target = RNDTarget(input_size=1024).to(self.device)
-        self.rnd_predictor = RNDPredictor(input_size=1024).to(self.device)
+        self.rnd_target = RNDTarget(in_channels=3, output_size=512).to(self.device)
+        self.rnd_predictor = RNDPredictor(in_channels=3, output_size=512).to(self.device)
         self.rnd_target.eval()  # Freeze target network behavior
         self.rnd_mean = torch.zeros((), dtype=torch.float32, device=self.device)
         self.rnd_std = torch.ones((), dtype=torch.float32, device=self.device)
@@ -720,6 +734,13 @@ class Dreamer:
             param.requires_grad = False
             
         self.critic_ema_decay = 0.98
+        self.curiosity_critic_ema_decay = 0.90
+
+        # Exploration hyperparameters
+        self.rnd_threshold_k = 2.0           # rectify RND error below mean + k*std (sparser than 0.5)
+        self.dream_priority_fraction = 0.25  # fraction of dream starts resampled from high-novelty states
+        self.dream_head_subsample = 2048     # imagined states per update used to train the curiosity head
+
         self.image_encoder = EncoderImage().to(self.device)
         
         self.goal_encoder = GoalEncoder(ram_dim=ram_dim, ram_out_dim=self.ram_out_dim).to(self.device)
@@ -741,7 +762,7 @@ class Dreamer:
             num_envs=len(envs) 
         )
 
-        # WorldModelParameters (Includes Curiosity Predictor)
+        # WorldModelParameters
         self.worldModelParameters = (
             list(self.recurrentModel.parameters()) + 
             list(self.posteriorNet.parameters()) + 
@@ -754,9 +775,7 @@ class Dreamer:
             list(self.projector.parameters()) +
             list(self.goalPredictor.parameters()) +
             list(self.teamPredictor.parameters()) +
-            list(self.itemPredictor.parameters()) +
-            list(self.curiosityPredictor.parameters() ) +
-            list(self.rnd_predictor.parameters())
+            list(self.itemPredictor.parameters())
         )
 
         # Optimizers
@@ -764,6 +783,12 @@ class Dreamer:
         self.actorOptimizer = torch.optim.Adam(self.actor.parameters(), lr=4e-5)      
         self.criticOptimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-4)    
         self.curiosityCriticOptimizer = torch.optim.Adam(self.curiosity_critic.parameters(), lr=1e-4)
+        # Curiosity head: its own optimizer (trained on both replayed and imagined states)
+        self.curiosityHeadOptimizer = torch.optim.Adam(self.curiosityPredictor.parameters(), lr=1e-4)
+        # RND predictor: deliberately SLOW. Its convergence speed controls how fast novelty is
+        # erased. With ~200 gradient steps per collected episode, lr=2e-4 wiped out the novelty of
+        # once-visited places before the agent could ever return to them.
+        self.rndOptimizer = torch.optim.Adam(self.rnd_predictor.parameters(), lr=2e-5)
 
         # Statistics
         self.num_episodes = 0
@@ -862,41 +887,8 @@ class Dreamer:
         bt_loss = invariance_loss + alpha * redundancy_loss
         scaled_bt_loss = beta_BT * bt_loss
         # ----------------------------------------------------
-        # RND ERROR CURIOSITY (UPDATED)
+        # RND part
         # ----------------------------------------------------
-        # Target the encoded vector of the image
-        target_img_features = encoded_images[:, 1:].detach()
-        rnd_target_out = self.rnd_target(target_img_features)
-        rnd_pred = self.rnd_predictor(target_img_features)
-        rnd_loss = F.mse_loss(rnd_pred, rnd_target_out.detach()) * 100.0
-
-        with torch.no_grad():
-            # RND error (mistake) per step in sequence: shape [B, T-1]
-            rnd_error = torch.mean((rnd_pred.detach() - rnd_target_out.detach()) ** 2, dim=-1)
-            
-            # Compute batch statistics
-            batch_mean = rnd_error.mean().detach()
-            batch_std = rnd_error.std().detach()
-            
-            # Update running global mean & standard deviation indicators
-            if self.rnd_mean.item() == 0.0:
-                self.rnd_mean.copy_(batch_mean)
-                self.rnd_std.copy_(batch_std + 1e-6)
-            else:
-                decay = 0.99
-                self.rnd_mean.copy_(decay * self.rnd_mean + (1.0 - decay) * batch_mean)
-                self.rnd_std.copy_(decay * self.rnd_std + (1.0 - decay) * (batch_std + 1e-6))
-            
-            threshold = self.rnd_mean + 1 * self.rnd_std
-            rectified_error = torch.clamp(rnd_error - threshold, min=0.0)
-            transformed_error = 10 * rectified_error
-
-        # Train Curiosity Predictor on RND mistakes
-        pred_curiosity_logits = self.curiosityPredictor(full_states_prior.detach())
-        with torch.no_grad():
-            target_curiosity = self.curiosity_two_hot.encode(transformed_error.detach())
-            
-        curiosity_loss = -torch.mean(torch.sum(target_curiosity * torch.log_softmax(pred_curiosity_logits, dim=-1), dim=-1)) * 100.0
 
         reward_logits_ensemble = self.rewardPredictor(full_states) # [num_heads, B, T-1, num_bins]
         
@@ -939,8 +931,8 @@ class Dreamer:
         posterior_loss = 0.1 * torch.maximum(posterior_loss, freeNats)
         kl_loss = (prior_loss + posterior_loss).mean()
 
-        # TOTAL LOSS (Includes Curiosity Predictor loss and RND loss)
-        world_model_loss = scaled_bt_loss + kl_loss + goal_loss + reward_loss + team_loss + item_loss + curiosity_loss + rnd_loss
+        # TOTAL LOSS (curiosity head and RND are now trained separately below)
+        world_model_loss = scaled_bt_loss + kl_loss + goal_loss + reward_loss + team_loss + item_loss
 
         # Standard FP32 Backward pass
         world_model_loss.backward()
@@ -957,6 +949,52 @@ class Dreamer:
         decoder_loss.backward()
         self.decoderOptimizer.step()
 
+        # ----------------------------------------------------
+        # DECODER-BASED RND CURIOSITY
+        # ----------------------------------------------------
+        prior_states_flat = full_states_prior.detach().view(-1, self.concatenated_dim)
+        with torch.no_grad():
+            decoded_prior = self.decoder(prior_states_flat).clamp(0.0, 1.0)
+            rnd_target_out = self.rnd_target(decoded_prior)
+
+        # Train the RND predictor ONLY on states from real trajectories
+        self.rndOptimizer.zero_grad(set_to_none=True)
+        rnd_pred = self.rnd_predictor(decoded_prior)
+        rnd_loss = F.mse_loss(rnd_pred, rnd_target_out)
+        rnd_loss.backward()
+        self.rndOptimizer.step()
+
+        with torch.no_grad():
+            # Per-state RND error: shape [B*(T-1)]
+            rnd_error = torch.mean((rnd_pred.detach() - rnd_target_out) ** 2, dim=-1)
+
+            # Update running statistics
+            batch_mean = rnd_error.mean()
+            batch_std = rnd_error.std()
+            if self.rnd_mean.item() == 0.0:
+                self.rnd_mean.copy_(batch_mean)
+                self.rnd_std.copy_(batch_std + 1e-6)
+            else:
+                decay = 0.99
+                self.rnd_mean.copy_(decay * self.rnd_mean + (1.0 - decay) * batch_mean)
+                self.rnd_std.copy_(decay * self.rnd_std + (1.0 - decay) * (batch_std + 1e-6))
+
+            # Sparse rectified novelty: zero for everything within mean + k*std, and normalized by the running std instead of an arbitrary fixed multiplier.
+            threshold = self.rnd_mean + self.rnd_threshold_k * self.rnd_std
+            rectified_error = torch.clamp(rnd_error - threshold, min=0.0)
+            transformed_error = rectified_error / (self.rnd_std + 1e-6)
+            target_curiosity = self.curiosity_two_hot.encode(transformed_error)
+
+        # --- Train the curiosity head on real (prior) states with its own optimizer ---
+        self.curiosityHeadOptimizer.zero_grad(set_to_none=True)
+        pred_curiosity_logits = self.curiosityPredictor(prior_states_flat)
+        curiosity_loss = -torch.mean(torch.sum(target_curiosity * torch.log_softmax(pred_curiosity_logits, dim=-1), dim=-1))
+        curiosity_loss.backward()
+        nn.utils.clip_grad_norm_(self.curiosityPredictor.parameters(), 10, norm_type=2)
+        self.curiosityHeadOptimizer.step()
+
+        # Priorities for dream-start selection: novelty of each state in this batch
+        dream_priorities = transformed_error.detach()
 
         metrics = {
             "world_model_loss": world_model_loss.item(),
@@ -967,24 +1005,43 @@ class Dreamer:
             "team_loss": team_loss.item(),
             "item_loss": item_loss.item(),
             "curiosity_loss": curiosity_loss.item(),
-            "rnd_loss": rnd_loss.item(),  # Log the RND loss
+            "rnd_loss": rnd_loss.item(),
+            "rnd_mean": self.rnd_mean.item(),
+            "rnd_novel_fraction": (transformed_error > 0).float().mean().item(),
             "decoder_loss": decoder_loss.item()
         }
 
-
-        return full_states.view(-1, self.concatenated_dim).detach(), metrics
+        return full_states.view(-1, self.concatenated_dim).detach(), dream_priorities, metrics
     
-    def Dream(self, full_state, batch_data=None, horizon=30):
+    def Dream(self, full_state, batch_data=None, horizon=30, dream_priorities=None):
         self.actorOptimizer.zero_grad(set_to_none=True)
         self.criticOptimizer.zero_grad(set_to_none=True)
         self.curiosityCriticOptimizer.zero_grad(set_to_none=True)
 
-        full_states = [full_state.detach()]
+        start_states = full_state.detach()
+
+        # --- PRIORITIZED DREAM STARTS ("return, then explore") ---
+        # Rare frontier states (e.g. a city visited once) make up a tiny fraction of the batch, so
+        # the actor almost never gets gradient signal from them. We replace a fraction of dream
+        # starts with states sampled proportionally to their RND novelty, so the policy repeatedly
+        # practices acting FROM the frontier. The remaining uniform starts protect against
+        # forgetting (reward-driven behavior keeps being trained everywhere else).
+        if dream_priorities is not None:
+            pri = dream_priorities.detach().flatten().to(start_states.device)
+            N = start_states.shape[0]
+            num_pri = int(N * self.dream_priority_fraction)
+            if num_pri > 0 and torch.count_nonzero(pri) > 0:
+                probs = pri + 1e-8
+                pri_idx = torch.multinomial(probs, num_pri, replacement=True)
+                keep_idx = torch.randint(0, N, (N - num_pri,), device=start_states.device)
+                start_states = torch.cat([start_states[keep_idx], start_states[pri_idx]], dim=0)
+
+        full_states = [start_states]
         log_probabilities = []
         entropies = []
         actions_stack = [] 
 
-        curr_state = full_state.detach()
+        curr_state = start_states
         recurrent_state, latent_state = torch.split(curr_state, [self.recurrent_dim, self.latent_dim], -1)
 
         # --- IMAGINATION LOOP ---
@@ -1121,13 +1178,41 @@ class Dreamer:
         nn.utils.clip_grad_norm_(self.actor.parameters(), 1, norm_type=2) 
         self.actorOptimizer.step()
 
-        # Update EMA critic parameters
+        # Update EMA critic parameters (curiosity critic uses a faster EMA: its target decays)
         with torch.no_grad():
             for param, ema_param in zip(self.critic.parameters(), self.ema_critic.parameters()):
                 ema_param.data.copy_(self.critic_ema_decay * ema_param.data + (1.0 - self.critic_ema_decay) * param.data)
             for param, ema_param in zip(self.curiosity_critic.parameters(), self.ema_curiosity_critic.parameters()):
-                ema_param.data.copy_(self.critic_ema_decay * ema_param.data + (1.0 - self.critic_ema_decay) * param.data)
+                ema_param.data.copy_(self.curiosity_critic_ema_decay * ema_param.data + (1.0 - self.curiosity_critic_ema_decay) * param.data)
 
+        # --- TRAIN CURIOSITY HEAD ON THE DREAM DISTRIBUTION ---
+        # The head is evaluated on imagined states that may lie beyond any real trajectory; here we
+        # decode a subsample of them, query the (frozen this step) RND nets on the decoded frames,
+        # and distill that signal into the head. This closes the train/eval gap so that "dreaming
+        # further into unknown territory" reliably maps to high predicted curiosity.
+        # NOTE: the RND predictor itself is NOT updated here, only the head.
+        with torch.no_grad():
+            flat_imagined = imagined_steps.reshape(-1, self.concatenated_dim)
+            n_sub = min(self.dream_head_subsample, flat_imagined.shape[0])
+            sub_idx = torch.randperm(flat_imagined.shape[0], device=flat_imagined.device)[:n_sub]
+            sub_states = flat_imagined[sub_idx]
+            decoded_dream = self.decoder(sub_states).clamp(0.0, 1.0)
+            dream_rnd_target = self.rnd_target(decoded_dream)
+            dream_rnd_pred = self.rnd_predictor(decoded_dream)
+            dream_rnd_error = torch.mean((dream_rnd_pred - dream_rnd_target) ** 2, dim=-1)
+            dream_threshold = self.rnd_mean + self.rnd_threshold_k * self.rnd_std
+            dream_rectified = torch.clamp(dream_rnd_error - dream_threshold, min=0.0)
+            dream_transformed = dream_rectified / (self.rnd_std + 1e-6)
+            dream_target_curiosity = self.curiosity_two_hot.encode(dream_transformed)
+
+        self.curiosityHeadOptimizer.zero_grad(set_to_none=True)
+        dream_curiosity_logits = self.curiosityPredictor(sub_states)
+        dream_curiosity_loss = -torch.mean(
+            torch.sum(dream_target_curiosity * torch.log_softmax(dream_curiosity_logits, dim=-1), dim=-1)
+        )
+        dream_curiosity_loss.backward()
+        nn.utils.clip_grad_norm_(self.curiosityPredictor.parameters(), 10, norm_type=2)
+        self.curiosityHeadOptimizer.step()
 
         metrics = {
             "actor_loss": actor_loss.item(),
@@ -1136,9 +1221,13 @@ class Dreamer:
             "entropies": entropies.mean().item(),
             "log_probabilities": log_probabilities.mean().item(),
             "reward_advantages": reward_advantages.mean().item(),
+            "advantages": reward_advantages.mean().item(),  # alias: policy.py logs this key
             "curiosity_advantages": curiosity_advantages.mean().item(),
             "critic_values": online_values.mean().item(), 
             "curiosity_critic_values": online_curiosity_values.mean().item(),
+            "dream_curiosity_loss": dream_curiosity_loss.item(),
+            "dream_novel_fraction": (dream_transformed > 0).float().mean().item(),
+            "dream_mean_curiosity": predicted_curiosity.mean().item(),
         }
 
         # Select the trajectory that exceeds the expectation of both reward and exploration critics
@@ -1189,6 +1278,7 @@ class Dreamer:
         current_rewards = [0.0] * num_envs
 
         local_buffers = [[] for _ in range(num_envs)]
+        maps_visited = [set() for _ in range(num_envs)]  # exploration telemetry
 
         recurrent_state = torch.zeros((num_envs, self.recurrent_dim), device=self.device)
         latent_state = torch.zeros((num_envs, self.latent_dim), device=self.device)
@@ -1223,6 +1313,13 @@ class Dreamer:
             latent_state, _ = self.posteriorNet(posterior_input)
 
             action_onehot, _, _ = self.actor(torch.cat((recurrent_state, latent_state), -1))
+
+            if epsilon > 0.0:
+                override = torch.rand(num_envs, device=self.device) < epsilon
+                if override.any():
+                    rand_actions = torch.randint(0, self.action_dim, (int(override.sum().item()),), device=self.device)
+                    action_onehot[override] = F.one_hot(rand_actions, self.action_dim).float()
+
             action = action_onehot
             
             action_idxs = torch.argmax(action, dim=-1).cpu().numpy()
@@ -1239,6 +1336,7 @@ class Dreamer:
                     next_ram = np.array(next_info["milestones"], dtype=np.float32)
                     next_team = np.array(next_info["team_levels"], dtype=np.float32)
                     next_item = np.array(next_info["item_counts"], dtype=np.float32)
+                    maps_visited[i].add(next_info["coord"][0])
 
                     local_buffers[i].append((
                         observations[i].copy(), 
@@ -1256,6 +1354,8 @@ class Dreamer:
 
                     if done:
                         episode_reward = current_rewards[i] 
+                        print(f"    [Env {i+1}] Episode done | Reward: {episode_reward:.2f} | Unique maps visited: {len(maps_visited[i])} {sorted(maps_visited[i])}")
+                        maps_visited[i] = set()
                         
                         # Sequential additions are handled automatically by the block buffer
                         for transition in local_buffers[i]:
@@ -1286,6 +1386,13 @@ class Dreamer:
                 local_buffers[i].clear()
 
         return round(sum(scores) / len(scores), 2) if len(scores) > 0 else 0.0
+
+    def reset_rnd_stats(self):
+        """Reset RND running statistics. Call ONCE when resuming a checkpoint that was trained with
+        raw-image RND: the stats will re-seed from the first batch of decoded-image errors."""
+        self.rnd_mean.zero_()
+        self.rnd_std.fill_(1.0)
+        print("[*] RND running statistics reset (will re-seed from the next batch).")
 
     def saveCheckpoints(self, path):
         directory = os.path.dirname(path)
@@ -1326,6 +1433,8 @@ class Dreamer:
             'actorOptimizer': self.actorOptimizer.state_dict(),
             'criticOptimizer': self.criticOptimizer.state_dict(),
             'curiosityCriticOptimizer': self.curiosityCriticOptimizer.state_dict(),
+            'curiosityHeadOptimizer': self.curiosityHeadOptimizer.state_dict(),
+            'rndOptimizer': self.rndOptimizer.state_dict(),
             
             # Progress
             'total_num_episodes': self.total_num_episodes,
@@ -1381,7 +1490,6 @@ class Dreamer:
             self.dynamicDataNormalizer.load_state_dict(checkpoint['dynamicDataNormalizer'])
 
             # Curiosity
-
             self.curiosityPredictor.load_state_dict(checkpoint['curiosityPredictor'])
             self.curiosity_critic.load_state_dict(checkpoint['curiosity_critic'])
             self.ema_curiosity_critic.load_state_dict(checkpoint['ema_curiosity_critic'])
@@ -1397,6 +1505,8 @@ class Dreamer:
             self.actorOptimizer.load_state_dict(checkpoint['actorOptimizer'])
             self.criticOptimizer.load_state_dict(checkpoint['criticOptimizer'])
             self.curiosityCriticOptimizer.load_state_dict(checkpoint['curiosityCriticOptimizer'])
+            self.curiosityHeadOptimizer.load_state_dict(checkpoint['curiosityHeadOptimizer'])
+            self.rndOptimizer.load_state_dict(checkpoint['rndOptimizer'])
             
             # Load Progress Counters
             self.total_num_episodes = checkpoint.get('total_num_episodes', 0)
