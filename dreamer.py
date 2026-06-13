@@ -186,6 +186,35 @@ class ItemPredictor(nn.Module):
         return self.net(x)
 
 
+class GridEncoder(nn.Module):
+    def __init__(self, grid_dim=81, grid_out_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(grid_dim, 128),
+            nn.LayerNorm(128),
+            nn.ELU(),
+            nn.Linear(128, grid_out_dim),
+            nn.LayerNorm(grid_out_dim)
+        )
+
+    def forward(self, grid):
+        return self.net(grid)
+
+
+class GridPredictor(nn.Module):
+    def __init__(self, input_size=768, grid_dim=81):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_size, 512),
+            nn.LayerNorm(512),
+            nn.SiLU(),
+            nn.Linear(512, grid_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class CuriosityPredictor(nn.Module):
     def __init__(self, input_size=768, num_bins=255):
         super().__init__()
@@ -198,9 +227,6 @@ class CuriosityPredictor(nn.Module):
             nn.SiLU(),
             nn.Linear(1024, num_bins)
         )
-        # Initialize final layer near zero for a stable initial categorical distribution.
-        # NOTE: with linear non-negative bins [0, 5], a uniform softmax decodes to 2.5 (the bin mean),
-        # not 0. We bias the first bin so the initial / out-of-distribution output decodes near 0.
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
         with torch.no_grad():
@@ -210,47 +236,7 @@ class CuriosityPredictor(nn.Module):
         return self.net(x)
 
 
-class RNDTarget(nn.Module):
-    def __init__(self, in_channels=3, output_size=512, **kwargs):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=4, stride=2, padding=1), # 64x64 -> 32x32
-            nn.ELU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1), # 32x32 -> 16x16
-            nn.ELU(),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1), # 16x16 -> 8x8
-            nn.ELU(),
-            nn.Flatten(),
-            nn.Linear(128 * 8 * 8, output_size)
-        )
-        # Randomly initialized and frozen parameters
-        for p in self.parameters():
-            p.requires_grad = False
 
-    def forward(self, x):
-        return self.net(x)
-
-
-class RNDPredictor(nn.Module):
-    def __init__(self, in_channels=3, output_size=512, **kwargs):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=4, stride=2, padding=1), # 64x64 -> 32x32
-            nn.ELU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1), # 32x32 -> 16x16
-            nn.ELU(),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1), # 16x16 -> 8x8
-            nn.ELU(),
-            nn.Flatten(),
-            nn.Linear(128 * 8 * 8, 512),
-            nn.ELU(),
-            nn.Linear(512, 512),
-            nn.ELU(),
-            nn.Linear(512, output_size)
-        )
-
-    def forward(self, x):
-        return self.net(x)
 
 
 class DynamicDataNormalizer(nn.Module):
@@ -288,7 +274,7 @@ class EnsembleRewardPredictor(nn.Module):
 
 
 class Buffer(object):
-    def __init__(self, device, capacity=800000, actionSize=6, ram_dim=8, item_dim=2, team_level_dim=6, num_envs=4):  
+    def __init__(self, device, capacity=800000, actionSize=6, ram_dim=8, item_dim=2, team_level_dim=6, grid_dim=81, num_envs=4):  
         self.device = device
         self.capacity = capacity
         self.num_envs = num_envs
@@ -296,19 +282,23 @@ class Buffer(object):
         self.rams = torch.empty((capacity, ram_dim), dtype=torch.float32, device='cpu')
         self.item_counts = torch.empty((capacity, item_dim), dtype=torch.float32, device='cpu')
         self.team_levels = torch.empty((capacity, team_level_dim), dtype=torch.float32, device='cpu')
+        self.grids = torch.empty((capacity, grid_dim), dtype=torch.float32, device='cpu')
         self.actions = torch.empty((capacity, actionSize), dtype=torch.float32, device='cpu')
         self.rewards = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
+        self.curiosities = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
         
         self.index = 0
         self.full = False
 
-    def add(self, observation, ram, item_count, team_level, action, reward):
+    def add(self, observation, ram, item_count, team_level, action, reward, curiosity, grid):
         self.observations[self.index] = torch.as_tensor(observation, dtype=torch.uint8)
         self.rams[self.index] = torch.as_tensor(ram, dtype=torch.float32)
         self.item_counts[self.index] = torch.as_tensor(item_count, dtype=torch.float32)
         self.team_levels[self.index] = torch.as_tensor(team_level, dtype=torch.float32)
+        self.grids[self.index] = torch.as_tensor(grid, dtype=torch.float32)
         self.actions[self.index] = torch.as_tensor(action, dtype=torch.float32)
         self.rewards[self.index] = torch.as_tensor(reward, dtype=torch.float32)
+        self.curiosities[self.index] = torch.as_tensor(curiosity, dtype=torch.float32)
 
         self.index = (self.index + 1) % self.capacity
         self.full = self.full or (self.index == 0)
@@ -367,8 +357,10 @@ class Buffer(object):
             "rams":         self.rams[sampleIndex].to(self.device, non_blocking=True), 
             "item_counts":  self.item_counts[sampleIndex].to(self.device, non_blocking=True),
             "team_levels":  self.team_levels[sampleIndex].to(self.device, non_blocking=True),
+            "grids":        self.grids[sampleIndex].to(self.device, non_blocking=True),
             "actions":      self.actions[sampleIndex].to(self.device, non_blocking=True),
             "rewards":      self.rewards[sampleIndex].to(self.device, non_blocking=True),
+            "curiosities":  self.curiosities[sampleIndex].to(self.device, non_blocking=True),
             "index":        sampleIndex.to(self.device, non_blocking=True)
         }
         return sample
@@ -380,8 +372,10 @@ class Buffer(object):
             'rams': self.rams[:limit].cpu(),
             'item_counts': self.item_counts[:limit].cpu(),
             'team_levels': self.team_levels[:limit].cpu(),
+            'grids': self.grids[:limit].cpu(),
             'actions': self.actions[:limit].cpu(),
             'rewards': self.rewards[:limit].cpu(),
+            'curiosities': self.curiosities[:limit].cpu(),
             'index': self.index,
             'full': self.full,
             'capacity': self.capacity
@@ -396,8 +390,10 @@ class Buffer(object):
         saved_rams = checkpoint['rams']
         saved_item_counts = checkpoint.get('item_counts', torch.zeros((saved_obs.shape[0], 2), dtype=torch.float32))
         saved_team_levels = checkpoint.get('team_levels', torch.zeros((saved_obs.shape[0], 6), dtype=torch.float32))
+        saved_grids = checkpoint.get('grids', torch.zeros((saved_obs.shape[0], self.grids.shape[1]), dtype=torch.float32))
         saved_actions = checkpoint['actions']
         saved_rewards = checkpoint['rewards']
+        saved_curiosities = checkpoint.get('curiosities', torch.zeros((saved_obs.shape[0], 1), dtype=torch.float32))
         
         old_index = checkpoint['index']
         old_full = checkpoint['full']
@@ -410,8 +406,10 @@ class Buffer(object):
             rams_ordered = torch.cat((saved_rams[old_index:], saved_rams[:old_index]), dim=0)
             item_ordered = torch.cat((saved_item_counts[old_index:], saved_item_counts[:old_index]), dim=0)
             team_ordered = torch.cat((saved_team_levels[old_index:], saved_team_levels[:old_index]), dim=0)
+            grids_ordered = torch.cat((saved_grids[old_index:], saved_grids[:old_index]), dim=0)
             actions_ordered = torch.cat((saved_actions[old_index:], saved_actions[:old_index]), dim=0)
             rewards_ordered = torch.cat((saved_rewards[old_index:], saved_rewards[:old_index]), dim=0)
+            curiosities_ordered = torch.cat((saved_curiosities[old_index:], saved_curiosities[:old_index]), dim=0)
             total_valid = old_capacity
         else:
             # Buffer never wrapped around, already chronological
@@ -419,8 +417,10 @@ class Buffer(object):
             rams_ordered = saved_rams[:old_index]
             item_ordered = saved_item_counts[:old_index]
             team_ordered = saved_team_levels[:old_index]
+            grids_ordered = saved_grids[:old_index]
             actions_ordered = saved_actions[:old_index]
             rewards_ordered = saved_rewards[:old_index]
+            curiosities_ordered = saved_curiosities[:old_index]
             total_valid = old_index
 
         # Handle the edge case if the new buffer is somehow SMALLER than the old valid data
@@ -429,21 +429,25 @@ class Buffer(object):
             rams_ordered = rams_ordered[-self.capacity:]
             item_ordered = item_ordered[-self.capacity:]
             team_ordered = team_ordered[-self.capacity:]
+            grids_ordered = grids_ordered[-self.capacity:]
             actions_ordered = actions_ordered[-self.capacity:]
             rewards_ordered = rewards_ordered[-self.capacity:]
+            curiosities_ordered = curiosities_ordered[-self.capacity:]
             total_valid = self.capacity
 
-        # Copy the ordered data into the beginning of our new buffer
-        self.observations[:total_valid].copy_(obs_ordered)
-        self.rams[:total_valid].copy_(rams_ordered)
-        self.item_counts[:total_valid].copy_(item_ordered)
-        self.team_levels[:total_valid].copy_(team_ordered)
-        self.actions[:total_valid].copy_(actions_ordered)
-        self.rewards[:total_valid].copy_(rewards_ordered)
+        # Load into the new tensors, aligning oldest at index 0 up to total_valid-1
+        self.observations[:total_valid] = obs_ordered
+        self.rams[:total_valid] = rams_ordered
+        self.item_counts[:total_valid] = item_ordered
+        self.team_levels[:total_valid] = team_ordered
+        self.grids[:total_valid] = grids_ordered
+        self.actions[:total_valid] = actions_ordered
+        self.rewards[:total_valid] = rewards_ordered
+        self.curiosities[:total_valid] = curiosities_ordered
 
         self.index = total_valid % self.capacity
         self.full = (total_valid == self.capacity)
-        print(f"[*] Buffer Resized/Loaded: {total_valid} elements loaded. New capacity: {self.capacity}")
+        print(f"[*] Loaded buffer containing {total_valid} transitions (full={self.full}, write_head={self.index})")
 
     def print_diagnostics(self):
         """Displays simple buffer metrics to maintain compatibility with policy.py"""
@@ -689,9 +693,11 @@ class Dreamer:
         self.ram_out_dim = 256
         self.team_out_dim = 128
         self.item_out_dim = 128
-        self.enconder_output_size = 1024 + self.ram_out_dim + self.team_out_dim + self.item_out_dim
+        self.grid_dim = 81
+        self.grid_out_dim = 128
+        self.enconder_output_size = 1024 + self.ram_out_dim + self.team_out_dim + self.item_out_dim + self.grid_out_dim
         
-        self.entropy_scale = 0.003
+        self.entropy_scale = 0.001
         self.number_of_sequences = number_of_sequences 
         self.steps_per_sequence = steps_per_sequence
         self.buffer_capacity = buffer_size
@@ -712,14 +718,7 @@ class Dreamer:
         self.actor = Actor(self.action_dim, self.device, self.concatenated_dim).to(self.device)
         self.decoder = Decoder(input_size=self.concatenated_dim).to(self.device)
         self.decoderOptimizer = torch.optim.Adam(self.decoder.parameters(), lr=2e-4)
-        self.curiosity_two_hot = LinearTwoHotEncoding(min_val=0.0, max_val=5.0, num_bins=255, device=self.device)
-        
-        # RND Networks and Statistics
-        self.rnd_target = RNDTarget(in_channels=3, output_size=512).to(self.device)
-        self.rnd_predictor = RNDPredictor(in_channels=3, output_size=512).to(self.device)
-        self.rnd_target.eval()  # Freeze target network behavior
-        self.rnd_mean = torch.zeros((), dtype=torch.float32, device=self.device)
-        self.rnd_std = torch.ones((), dtype=torch.float32, device=self.device)
+        self.curiosity_two_hot = LinearTwoHotEncoding(min_val=0.0, max_val=1.0, num_bins=255, device=self.device)
         
         # Reward Critic
         self.critic = Critic(self.concatenated_dim).to(self.device)
@@ -737,19 +736,19 @@ class Dreamer:
         self.curiosity_critic_ema_decay = 0.90
 
         # Exploration hyperparameters
-        self.rnd_threshold_k = 2.0           # rectify RND error below mean + k*std (sparser than 0.5)
-        self.dream_priority_fraction = 0.25  # fraction of dream starts resampled from high-novelty states
-        self.dream_head_subsample = 2048     # imagined states per update used to train the curiosity head
+        self.dream_priority_fraction = 0.10  # fraction of dream starts resampled from high-novelty states
 
         self.image_encoder = EncoderImage().to(self.device)
         
         self.goal_encoder = GoalEncoder(ram_dim=ram_dim, ram_out_dim=self.ram_out_dim).to(self.device)
         self.team_encoder = TeamEncoder(team_dim=team_dim, team_out_dim=self.team_out_dim).to(self.device)
         self.item_encoder = ItemEncoder(item_dim=item_dim, item_out_dim=self.item_out_dim).to(self.device)
+        self.grid_encoder = GridEncoder(grid_dim=self.grid_dim, grid_out_dim=self.grid_out_dim).to(self.device)
         
         self.goalPredictor = GoalPredictor(self.concatenated_dim, goal_dim=ram_dim).to(self.device)
         self.teamPredictor = TeamPredictor(self.concatenated_dim, team_dim=team_dim).to(self.device)
         self.itemPredictor = ItemPredictor(self.concatenated_dim, item_dim=item_dim).to(self.device)
+        self.gridPredictor = GridPredictor(self.concatenated_dim, grid_dim=self.grid_dim).to(self.device)
 
         # Buffer
         self.buffer = Buffer(
@@ -759,6 +758,7 @@ class Dreamer:
             ram_dim=ram_dim,
             item_dim=item_dim,
             team_level_dim=team_dim,
+            grid_dim=self.grid_dim,
             num_envs=len(envs) 
         )
 
@@ -772,10 +772,12 @@ class Dreamer:
             list(self.goal_encoder.parameters()) +    
             list(self.team_encoder.parameters()) +    
             list(self.item_encoder.parameters()) +    
+            list(self.grid_encoder.parameters()) +    
             list(self.projector.parameters()) +
             list(self.goalPredictor.parameters()) +
             list(self.teamPredictor.parameters()) +
-            list(self.itemPredictor.parameters())
+            list(self.itemPredictor.parameters()) +
+            list(self.gridPredictor.parameters())
         )
 
         # Optimizers
@@ -785,10 +787,6 @@ class Dreamer:
         self.curiosityCriticOptimizer = torch.optim.Adam(self.curiosity_critic.parameters(), lr=1e-4)
         # Curiosity head: its own optimizer (trained on both replayed and imagined states)
         self.curiosityHeadOptimizer = torch.optim.Adam(self.curiosityPredictor.parameters(), lr=1e-4)
-        # RND predictor: deliberately SLOW. Its convergence speed controls how fast novelty is
-        # erased. With ~200 gradient steps per collected episode, lr=2e-4 wiped out the novelty of
-        # once-visited places before the agent could ever return to them.
-        self.rndOptimizer = torch.optim.Adam(self.rnd_predictor.parameters(), lr=2e-5)
 
         # Statistics
         self.num_episodes = 0
@@ -813,11 +811,13 @@ class Dreamer:
         ram_flat = batch_data["rams"].flatten(0, 1)
         team_flat = batch_data["team_levels"].flatten(0, 1)
         item_flat = batch_data["item_counts"].flatten(0, 1)
+        grid_flat = batch_data["grids"].flatten(0, 1)
         
         encoded_images = self.image_encoder(obs_flat).view(self.number_of_sequences, self.steps_per_sequence, -1)
         encoded_goals = self.goal_encoder(ram_flat).view(self.number_of_sequences, self.steps_per_sequence, -1)   
         encoded_team = self.team_encoder(team_flat / 100.0).view(self.number_of_sequences, self.steps_per_sequence, -1)
         encoded_items = self.item_encoder(item_flat / 10.0).view(self.number_of_sequences, self.steps_per_sequence, -1)
+        encoded_grids = self.grid_encoder(grid_flat).view(self.number_of_sequences, self.steps_per_sequence, -1)
         
         previous_recurrent_state = torch.zeros(self.number_of_sequences, self.recurrent_dim, device=self.device) 
         previous_latent_state = torch.zeros(self.number_of_sequences, self.latent_dim, device=self.device) 
@@ -831,7 +831,7 @@ class Dreamer:
         for t in range(1, self.steps_per_sequence): 
             recurrent_state = self.recurrentModel(previous_recurrent_state, previous_latent_state, batch_data["actions"][:, t-1])
             prior_sample, prior_logits = self.priorNet(recurrent_state) 
-            posterior_input = torch.cat((recurrent_state, encoded_images[:, t], encoded_goals[:, t], encoded_team[:, t], encoded_items[:, t]), dim=-1)
+            posterior_input = torch.cat((recurrent_state, encoded_images[:, t], encoded_goals[:, t], encoded_team[:, t], encoded_items[:, t], encoded_grids[:, t]), dim=-1)
             posterior, posterior_logits = self.posteriorNet(posterior_input)
 
             recurrent_states.append(recurrent_state)
@@ -887,7 +887,7 @@ class Dreamer:
         bt_loss = invariance_loss + alpha * redundancy_loss
         scaled_bt_loss = beta_BT * bt_loss
         # ----------------------------------------------------
-        # RND part
+        # REWARD PREDICTOR & AUXILIARY TASKS
         # ----------------------------------------------------
 
         reward_logits_ensemble = self.rewardPredictor(full_states) # [num_heads, B, T-1, num_bins]
@@ -923,6 +923,11 @@ class Dreamer:
         target_items = batch_data["item_counts"][:, 1:] / 10.0
         item_loss = F.mse_loss(pred_items, target_items) * 100.0
 
+        # grid prediction loss (predicting exploration grid)
+        pred_grids = self.gridPredictor(full_states)
+        target_grids = batch_data["grids"][:, 1:]
+        grid_loss = F.binary_cross_entropy_with_logits(pred_grids, target_grids) * 100.0
+
         # kl loss
         prior_loss = kl_divergence(posterior_distribution_SG, prior_distribution)
         posterior_loss = kl_divergence(posterior_distribution, prior_distribution_SG)
@@ -931,8 +936,8 @@ class Dreamer:
         posterior_loss = 0.1 * torch.maximum(posterior_loss, freeNats)
         kl_loss = (prior_loss + posterior_loss).mean()
 
-        # TOTAL LOSS (curiosity head and RND are now trained separately below)
-        world_model_loss = scaled_bt_loss + kl_loss + goal_loss + reward_loss + team_loss + item_loss
+        # TOTAL LOSS (curiosity head is trained separately below)
+        world_model_loss = scaled_bt_loss + kl_loss + goal_loss + reward_loss + team_loss + item_loss + grid_loss
 
         # Standard FP32 Backward pass
         world_model_loss.backward()
@@ -950,40 +955,11 @@ class Dreamer:
         self.decoderOptimizer.step()
 
         # ----------------------------------------------------
-        # DECODER-BASED RND CURIOSITY
+        # COORD-DISCOVERY CURIOSITY TRAINING
         # ----------------------------------------------------
         prior_states_flat = full_states_prior.detach().view(-1, self.concatenated_dim)
         with torch.no_grad():
-            decoded_prior = self.decoder(prior_states_flat).clamp(0.0, 1.0)
-            rnd_target_out = self.rnd_target(decoded_prior)
-
-        # Train the RND predictor ONLY on states from real trajectories
-        self.rndOptimizer.zero_grad(set_to_none=True)
-        rnd_pred = self.rnd_predictor(decoded_prior)
-        rnd_loss = F.mse_loss(rnd_pred, rnd_target_out)
-        rnd_loss.backward()
-        self.rndOptimizer.step()
-
-        with torch.no_grad():
-            # Per-state RND error: shape [B*(T-1)]
-            rnd_error = torch.mean((rnd_pred.detach() - rnd_target_out) ** 2, dim=-1)
-
-            # Update running statistics
-            batch_mean = rnd_error.mean()
-            batch_std = rnd_error.std()
-            if self.rnd_mean.item() == 0.0:
-                self.rnd_mean.copy_(batch_mean)
-                self.rnd_std.copy_(batch_std + 1e-6)
-            else:
-                decay = 0.99
-                self.rnd_mean.copy_(decay * self.rnd_mean + (1.0 - decay) * batch_mean)
-                self.rnd_std.copy_(decay * self.rnd_std + (1.0 - decay) * (batch_std + 1e-6))
-
-            # Sparse rectified novelty: zero for everything within mean + k*std, and normalized by the running std instead of an arbitrary fixed multiplier.
-            threshold = self.rnd_mean + self.rnd_threshold_k * self.rnd_std
-            rectified_error = torch.clamp(rnd_error - threshold, min=0.0)
-            transformed_error = rectified_error / (self.rnd_std + 1e-6)
-            target_curiosity = self.curiosity_two_hot.encode(transformed_error)
+            target_curiosity = self.curiosity_two_hot.encode(batch_data["curiosities"][:, :-1].squeeze(-1).reshape(-1))
 
         # --- Train the curiosity head on real (prior) states with its own optimizer ---
         self.curiosityHeadOptimizer.zero_grad(set_to_none=True)
@@ -993,8 +969,8 @@ class Dreamer:
         nn.utils.clip_grad_norm_(self.curiosityPredictor.parameters(), 10, norm_type=2)
         self.curiosityHeadOptimizer.step()
 
-        # Priorities for dream-start selection: novelty of each state in this batch
-        dream_priorities = transformed_error.detach()
+        # Priorities for dream-start selection: actual curiosity values
+        dream_priorities = batch_data["curiosities"][:, :-1].reshape(-1).detach()
 
         metrics = {
             "world_model_loss": world_model_loss.item(),
@@ -1004,28 +980,20 @@ class Dreamer:
             "goal_loss": goal_loss.item(),
             "team_loss": team_loss.item(),
             "item_loss": item_loss.item(),
+            "grid_loss": grid_loss.item(),
             "curiosity_loss": curiosity_loss.item(),
-            "rnd_loss": rnd_loss.item(),
-            "rnd_mean": self.rnd_mean.item(),
-            "rnd_novel_fraction": (transformed_error > 0).float().mean().item(),
             "decoder_loss": decoder_loss.item()
         }
 
         return full_states.view(-1, self.concatenated_dim).detach(), dream_priorities, metrics
     
-    def Dream(self, full_state, batch_data=None, horizon=30, dream_priorities=None):
+    def Dream(self, full_state, batch_data=None, horizon=20, dream_priorities=None):
         self.actorOptimizer.zero_grad(set_to_none=True)
         self.criticOptimizer.zero_grad(set_to_none=True)
         self.curiosityCriticOptimizer.zero_grad(set_to_none=True)
 
         start_states = full_state.detach()
 
-        # --- PRIORITIZED DREAM STARTS ("return, then explore") ---
-        # Rare frontier states (e.g. a city visited once) make up a tiny fraction of the batch, so
-        # the actor almost never gets gradient signal from them. We replace a fraction of dream
-        # starts with states sampled proportionally to their RND novelty, so the policy repeatedly
-        # practices acting FROM the frontier. The remaining uniform starts protect against
-        # forgetting (reward-driven behavior keeps being trained everywhere else).
         if dream_priorities is not None:
             pri = dream_priorities.detach().flatten().to(start_states.device)
             N = start_states.shape[0]
@@ -1185,35 +1153,6 @@ class Dreamer:
             for param, ema_param in zip(self.curiosity_critic.parameters(), self.ema_curiosity_critic.parameters()):
                 ema_param.data.copy_(self.curiosity_critic_ema_decay * ema_param.data + (1.0 - self.curiosity_critic_ema_decay) * param.data)
 
-        # --- TRAIN CURIOSITY HEAD ON THE DREAM DISTRIBUTION ---
-        # The head is evaluated on imagined states that may lie beyond any real trajectory; here we
-        # decode a subsample of them, query the (frozen this step) RND nets on the decoded frames,
-        # and distill that signal into the head. This closes the train/eval gap so that "dreaming
-        # further into unknown territory" reliably maps to high predicted curiosity.
-        # NOTE: the RND predictor itself is NOT updated here, only the head.
-        with torch.no_grad():
-            flat_imagined = imagined_steps.reshape(-1, self.concatenated_dim)
-            n_sub = min(self.dream_head_subsample, flat_imagined.shape[0])
-            sub_idx = torch.randperm(flat_imagined.shape[0], device=flat_imagined.device)[:n_sub]
-            sub_states = flat_imagined[sub_idx]
-            decoded_dream = self.decoder(sub_states).clamp(0.0, 1.0)
-            dream_rnd_target = self.rnd_target(decoded_dream)
-            dream_rnd_pred = self.rnd_predictor(decoded_dream)
-            dream_rnd_error = torch.mean((dream_rnd_pred - dream_rnd_target) ** 2, dim=-1)
-            dream_threshold = self.rnd_mean + self.rnd_threshold_k * self.rnd_std
-            dream_rectified = torch.clamp(dream_rnd_error - dream_threshold, min=0.0)
-            dream_transformed = dream_rectified / (self.rnd_std + 1e-6)
-            dream_target_curiosity = self.curiosity_two_hot.encode(dream_transformed)
-
-        self.curiosityHeadOptimizer.zero_grad(set_to_none=True)
-        dream_curiosity_logits = self.curiosityPredictor(sub_states)
-        dream_curiosity_loss = -torch.mean(
-            torch.sum(dream_target_curiosity * torch.log_softmax(dream_curiosity_logits, dim=-1), dim=-1)
-        )
-        dream_curiosity_loss.backward()
-        nn.utils.clip_grad_norm_(self.curiosityPredictor.parameters(), 10, norm_type=2)
-        self.curiosityHeadOptimizer.step()
-
         metrics = {
             "actor_loss": actor_loss.item(),
             "critic_loss": critic_loss.item(),
@@ -1225,8 +1164,6 @@ class Dreamer:
             "curiosity_advantages": curiosity_advantages.mean().item(),
             "critic_values": online_values.mean().item(), 
             "curiosity_critic_values": online_curiosity_values.mean().item(),
-            "dream_curiosity_loss": dream_curiosity_loss.item(),
-            "dream_novel_fraction": (dream_transformed > 0).float().mean().item(),
             "dream_mean_curiosity": predicted_curiosity.mean().item(),
         }
 
@@ -1288,6 +1225,7 @@ class Dreamer:
         rams = []
         team_levels = []
         item_counts = []
+        grids = []
 
         for env in self.envs:
             obs, info = env.reset()
@@ -1295,6 +1233,7 @@ class Dreamer:
             rams.append(np.array(info["milestones"], dtype=np.float32))
             team_levels.append(np.array(info["team_levels"], dtype=np.float32))
             item_counts.append(np.array(info["item_counts"], dtype=np.float32))
+            grids.append(np.array(info["grid"], dtype=np.float32))
 
         while min(episodes_completed) < number_of_episodes_per_env:
             
@@ -1302,14 +1241,16 @@ class Dreamer:
             ram_tensor = torch.from_numpy(np.array(rams)).float().to(self.device)
             team_tensor = torch.from_numpy(np.array(team_levels)).float().to(self.device)
             item_tensor = torch.from_numpy(np.array(item_counts)).float().to(self.device)
+            grid_tensor = torch.from_numpy(np.array(grids)).float().to(self.device)
 
             encoded_img = self.image_encoder(obs_tensor)
             encoded_goal = self.goal_encoder(ram_tensor) 
             encoded_team = self.team_encoder(team_tensor / 100.0)
             encoded_item = self.item_encoder(item_tensor / 10.0)
+            encoded_grid = self.grid_encoder(grid_tensor)
 
             recurrent_state = self.recurrentModel(recurrent_state, latent_state, action)
-            posterior_input = torch.cat((recurrent_state, encoded_img, encoded_goal, encoded_team, encoded_item), -1)
+            posterior_input = torch.cat((recurrent_state, encoded_img, encoded_goal, encoded_team, encoded_item, encoded_grid), -1)
             latent_state, _ = self.posteriorNet(posterior_input)
 
             action_onehot, _, _ = self.actor(torch.cat((recurrent_state, latent_state), -1))
@@ -1336,7 +1277,10 @@ class Dreamer:
                     next_ram = np.array(next_info["milestones"], dtype=np.float32)
                     next_team = np.array(next_info["team_levels"], dtype=np.float32)
                     next_item = np.array(next_info["item_counts"], dtype=np.float32)
+                    next_grid = np.array(next_info["grid"], dtype=np.float32)
                     maps_visited[i].add(next_info["coord"][0])
+
+                    curiosity = next_info.get("curiosity", 0.0)
 
                     local_buffers[i].append((
                         observations[i].copy(), 
@@ -1344,13 +1288,16 @@ class Dreamer:
                         item_counts[i].copy(),  
                         team_levels[i].copy(),  
                         actions_for_buffer[i].copy(), 
-                        reward
+                        reward,
+                        curiosity,
+                        grids[i].copy()
                     ))
 
                     observations[i] = next_observation
                     rams[i] = next_ram
                     team_levels[i] = next_team
                     item_counts[i] = next_item
+                    grids[i] = next_grid
 
                     if done:
                         episode_reward = current_rewards[i] 
@@ -1373,6 +1320,7 @@ class Dreamer:
                             rams[i] = np.array(next_info["milestones"], dtype=np.float32)
                             team_levels[i] = np.array(next_info["team_levels"], dtype=np.float32)
                             item_counts[i] = np.array(next_info["item_counts"], dtype=np.float32)
+                            grids[i] = np.array(next_info["grid"], dtype=np.float32)
                             current_rewards[i] = 0.0
                             
                             recurrent_state[i] = torch.zeros(self.recurrent_dim, device=self.device)
@@ -1387,12 +1335,7 @@ class Dreamer:
 
         return round(sum(scores) / len(scores), 2) if len(scores) > 0 else 0.0
 
-    def reset_rnd_stats(self):
-        """Reset RND running statistics. Call ONCE when resuming a checkpoint that was trained with
-        raw-image RND: the stats will re-seed from the first batch of decoded-image errors."""
-        self.rnd_mean.zero_()
-        self.rnd_std.fill_(1.0)
-        print("[*] RND running statistics reset (will re-seed from the next batch).")
+
 
     def saveCheckpoints(self, path):
         directory = os.path.dirname(path)
@@ -1410,9 +1353,11 @@ class Dreamer:
             'goal_encoder': self.goal_encoder.state_dict(),
             'team_encoder': self.team_encoder.state_dict(),
             'item_encoder': self.item_encoder.state_dict(),
+            'grid_encoder': self.grid_encoder.state_dict(),
             'goalPredictor': self.goalPredictor.state_dict(),
             'teamPredictor': self.teamPredictor.state_dict(),
             'itemPredictor': self.itemPredictor.state_dict(),
+            'gridPredictor': self.gridPredictor.state_dict(),
             'projector': self.projector.state_dict(),
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict(),
@@ -1423,10 +1368,6 @@ class Dreamer:
             'curiosityDynamicDataNormalizer': self.curiosityDynamicDataNormalizer.state_dict(),
             'decoder': self.decoder.state_dict(),
             'decoderOptimizer': self.decoderOptimizer.state_dict(),
-            'rnd_target': self.rnd_target.state_dict(),
-            'rnd_predictor': self.rnd_predictor.state_dict(),
-            'rnd_mean': self.rnd_mean,
-            'rnd_std': self.rnd_std,
             
             # Optimizers
             'worldModelOptimizer': self.worldModelOptimizer.state_dict(),
@@ -1434,7 +1375,6 @@ class Dreamer:
             'criticOptimizer': self.criticOptimizer.state_dict(),
             'curiosityCriticOptimizer': self.curiosityCriticOptimizer.state_dict(),
             'curiosityHeadOptimizer': self.curiosityHeadOptimizer.state_dict(),
-            'rndOptimizer': self.rndOptimizer.state_dict(),
             
             # Progress
             'total_num_episodes': self.total_num_episodes,
@@ -1480,6 +1420,7 @@ class Dreamer:
             self.goal_encoder.load_state_dict(checkpoint['goal_encoder'])
             self.team_encoder.load_state_dict(checkpoint['team_encoder'])
             self.item_encoder.load_state_dict(checkpoint['item_encoder'])
+            self.grid_encoder.load_state_dict(checkpoint['grid_encoder'])
             self.projector.load_state_dict(checkpoint['projector'])
             self.actor.load_state_dict(checkpoint['actor'])
             self.critic.load_state_dict(checkpoint['critic'])
@@ -1487,6 +1428,7 @@ class Dreamer:
             self.goalPredictor.load_state_dict(checkpoint['goalPredictor'])
             self.teamPredictor.load_state_dict(checkpoint['teamPredictor'])
             self.itemPredictor.load_state_dict(checkpoint['itemPredictor'])
+            self.gridPredictor.load_state_dict(checkpoint['gridPredictor'])
             self.dynamicDataNormalizer.load_state_dict(checkpoint['dynamicDataNormalizer'])
 
             # Curiosity
@@ -1494,8 +1436,6 @@ class Dreamer:
             self.curiosity_critic.load_state_dict(checkpoint['curiosity_critic'])
             self.ema_curiosity_critic.load_state_dict(checkpoint['ema_curiosity_critic'])
             self.curiosityDynamicDataNormalizer.load_state_dict(checkpoint['curiosityDynamicDataNormalizer'])
-            self.rnd_target.load_state_dict(checkpoint['rnd_target'])
-            self.rnd_predictor.load_state_dict(checkpoint['rnd_predictor'])
 
             # Decoder for visualization
             self.decoder.load_state_dict(checkpoint['decoder'])
@@ -1506,16 +1446,11 @@ class Dreamer:
             self.criticOptimizer.load_state_dict(checkpoint['criticOptimizer'])
             self.curiosityCriticOptimizer.load_state_dict(checkpoint['curiosityCriticOptimizer'])
             self.curiosityHeadOptimizer.load_state_dict(checkpoint['curiosityHeadOptimizer'])
-            self.rndOptimizer.load_state_dict(checkpoint['rndOptimizer'])
             
             # Load Progress Counters
             self.total_num_episodes = checkpoint.get('total_num_episodes', 0)
             self.total_num_steps = checkpoint.get('total_num_steps', 0)
             self.total_num_updates = checkpoint.get('total_num_updates', 0)
-
-            #load RND normalization stats
-            self.rnd_mean = checkpoint['rnd_mean'].to(self.device)
-            self.rnd_std = checkpoint['rnd_std'].to(self.device)
 
             # Load Buffer
             directory = os.path.dirname(path)

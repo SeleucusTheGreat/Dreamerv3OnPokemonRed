@@ -10,7 +10,7 @@ from dreamer import Dreamer
 
 
 class Policy(nn.Module):
-    def __init__(self, envs, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')):
+    def __init__(self, envs, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'), visualize_dreams=False):
         super(Policy, self).__init__()
         self.device = device
         self.envs = envs
@@ -21,12 +21,14 @@ class Policy(nn.Module):
         self.cols = 32
         self.latent_dim = self.rows * self.cols
         self.total_num_episodes = 10000
-        self.training_per_episodes = 200
+        self.training_per_episodes = 300
         self.seed = 1234
         self.number_of_sequences = 64 # Batch size
         self.steps_per_sequence = 64
-        self.curiosity_scale = 0.1
+        self.curiosity_scale = 0.25
+        self.checkpoint_interval = 3 # Save every N episodes
         
+        self.visualize_dreams = visualize_dreams
         self.seedMeDaddy(self.seed)
 
         self.dreamer = Dreamer(
@@ -50,15 +52,12 @@ class Policy(nn.Module):
 
     def train(self):
         self.dreamer.loadCheckpoints()
-        RESET_RND_STATS_ON_RESUME = False
-        if RESET_RND_STATS_ON_RESUME:
-            self.dreamer.reset_rnd_stats()
 
         csv_filename = "pokemon_training_metrics.csv"
         
         headers =[
             "envSteps", "gradientSteps", "totalReward", 
-            "worldModelLoss", "reconstructionLoss", "rewardPredictorLoss", "klLoss", "goalLoss", "teamLoss", "itemLoss", "curiosityLoss",
+            "worldModelLoss", "reconstructionLoss", "rewardPredictorLoss", "klLoss", "goalLoss", "teamLoss", "itemLoss", "gridLoss", "curiosityLoss",
             "actorLoss", "entropies", "criticLoss", "curiosityCriticLoss", "advantages", "curiosityAdvantages", "criticValues", "curiosityCriticValues"
         ]
         
@@ -80,11 +79,18 @@ class Policy(nn.Module):
                 print(f"[!] Warning: Could not recover steps from CSV: {e}")
 
         # --- Initial Buffer Fill ---
-        print("\n" + "="*50)
-        print("[*] Gathering initial data from environment...")
-        initial_score = self.dreamer.Play_the_game(number_of_episodes_per_env=0) 
-        print(f"[*] Initial Collection Score: {initial_score}")
-        print("="*50 + "\n")
+        buffer_has_transitions = self.dreamer.buffer.full or (self.dreamer.buffer.index > 0)
+        if not buffer_has_transitions:
+            print("\n" + "="*50)
+            print("[*] Replay buffer is empty. Gathering initial data from environment...")
+            initial_score = self.dreamer.Play_the_game(number_of_episodes_per_env=1) 
+            print(f"[*] Initial Collection Score: {initial_score}")
+            print("="*50 + "\n")
+        else:
+            print("\n" + "="*50)
+            #initial_score = self.dreamer.Play_the_game(number_of_episodes_per_env=2)
+            print("[*] Replay buffer already contains data. Skipping initial environment collection.")
+            print("="*50 + "\n")
 
         # --- Main Training Loop ---
         print("[*] Starting Training Loop...")
@@ -107,7 +113,7 @@ class Policy(nn.Module):
                 
                 # Update Networks
                 full_states, dream_priorities, wm_metrics = self.dreamer.TrainWorldModel(sample)
-                # Catch all three dreams (dream starts are partially prioritized by RND novelty)
+                # Catch all three dreams (dream starts are partially prioritized by actual curiosities)
                 dream_metrics, best_dream, rand_dream, cur_dream = self.dreamer.Dream(
                     full_states, batch_data=sample, dream_priorities=dream_priorities
                 )
@@ -117,45 +123,46 @@ class Policy(nn.Module):
                 curiosity_dreams_of_episode.append(cur_dream)
                 self.dreamer.total_num_updates += 1
 
-            # --- Visualize Half Random, Half Best ---
-            total_to_visualize = 10
-            half_k = total_to_visualize // 2
-            
-            # Sample from the pools
-            vis_best = random.sample(best_dreams_of_episode, min(half_k, len(best_dreams_of_episode)))
-            vis_rand = random.sample(random_dreams_of_episode, min(half_k, len(random_dreams_of_episode)))
-            
-            # Sort curiosity dreams by total curiosity (descending) and take top 5
-            curiosity_dreams_of_episode.sort(key=lambda x: x[0], reverse=True)
-            vis_curiosity = curiosity_dreams_of_episode[:5]
-            
-            dreams_to_visualize = vis_best + vis_rand + vis_curiosity
-            
-            # Print a quick summary
-            best_adv_str = ", ".join([f"{d[0]:+.2f}" for d in vis_best])
-            rand_adv_str = ", ".join([f"{d[0]:+.2f}" for d in vis_rand])
-            cur_str = ", ".join([f"{d[0]:+.2f}" for d in vis_curiosity])
-            print(f"[*] Visualizing {len(vis_best)} MAX ADVANTAGE Dreams (Cumulative Advs: [{best_adv_str}])")
-            print(f"[*] Visualizing {len(vis_rand)} RANDOM Dreams (Cumulative Advs: [{rand_adv_str}])")
-            print(f"[*] Visualizing {len(vis_curiosity)} MAX CURIOSITY Dreams (Cumulative Curiosity: [{cur_str}])")
-            
-            for rank, dream_data in enumerate(dreams_to_visualize):
-                metric_val, b_states, b_rewards, b_values, b_actions, b_advantages, label = dream_data
+            if self.visualize_dreams:
+                # --- Visualize Half Random, Half Best ---
+                total_to_visualize = 10
+                half_k = total_to_visualize // 2
                 
-                # Change the text dynamically based on what sorting metric was passed
-                if label == "MaxCuriosity":
-                    title_pref = f"{label} Dream (Total Curiosity: {metric_val:+.2f})"
-                else:
-                    title_pref = f"{label} Dream (Total Adv: {metric_val:+.2f})"
+                # Sample from the pools
+                vis_best = random.sample(best_dreams_of_episode, min(half_k, len(best_dreams_of_episode)))
+                vis_rand = random.sample(random_dreams_of_episode, min(half_k, len(random_dreams_of_episode)))
                 
-                self.dreamer.visualize_single_dream(
-                    b_states.to(self.device), 
-                    b_rewards, 
-                    b_values, 
-                    b_actions, 
-                    b_advantages,
-                    title_prefix=title_pref
-                )
+                # Sort curiosity dreams by total curiosity (descending) and take top 5
+                curiosity_dreams_of_episode.sort(key=lambda x: x[0], reverse=True)
+                vis_curiosity = curiosity_dreams_of_episode[:5]
+                
+                dreams_to_visualize = vis_best + vis_rand + vis_curiosity
+                
+                # Print a quick summary
+                best_adv_str = ", ".join([f"{d[0]:+.2f}" for d in vis_best])
+                rand_adv_str = ", ".join([f"{d[0]:+.2f}" for d in vis_rand])
+                cur_str = ", ".join([f"{d[0]:+.2f}" for d in vis_curiosity])
+                print(f"[*] Visualizing {len(vis_best)} MAX ADVANTAGE Dreams (Cumulative Advs: [{best_adv_str}])")
+                print(f"[*] Visualizing {len(vis_rand)} RANDOM Dreams (Cumulative Advs: [{rand_adv_str}])")
+                print(f"[*] Visualizing {len(vis_curiosity)} MAX CURIOSITY Dreams (Cumulative Curiosity: [{cur_str}])")
+                
+                for rank, dream_data in enumerate(dreams_to_visualize):
+                    metric_val, b_states, b_rewards, b_values, b_actions, b_advantages, label = dream_data
+                    
+                    # Change the text dynamically based on what sorting metric was passed
+                    if label == "MaxCuriosity":
+                        title_pref = f"{label} Dream (Total Curiosity: {metric_val:+.2f})"
+                    else:
+                        title_pref = f"{label} Dream (Total Adv: {metric_val:+.2f})"
+                    
+                    self.dreamer.visualize_single_dream(
+                        b_states.to(self.device), 
+                        b_rewards, 
+                        b_values, 
+                        b_actions, 
+                        b_advantages,
+                        title_prefix=title_pref
+                    )
             # --- Play Game with Updated Policy ---
             print(f"[*] Stepping environment with updated policy...")
             avg_score = self.dreamer.Play_the_game(number_of_episodes_per_env=1)
@@ -167,8 +174,7 @@ class Policy(nn.Module):
             print(f"    > Gradient Steps  : {self.dreamer.total_num_updates}")
             print(f"    > Total Reward    : {avg_score:.2f}")
             print(f"    > Actor Entropy   : {dream_metrics.get('entropies', 0):.4f}")
-            print(f"    > Novel frac (replay): {wm_metrics.get('rnd_novel_fraction', 0):.4f} | Novel frac (dream): {dream_metrics.get('dream_novel_fraction', 0):.4f}")
-            print(f"    > Mean dream curiosity: {dream_metrics.get('dream_mean_curiosity', 0):.4f} | RND mean err: {wm_metrics.get('rnd_mean', 0):.6f}")
+            print(f"    > Mean dream curiosity: {dream_metrics.get('dream_mean_curiosity', 0):.4f}")
 
             # --- CSV Logging ---
             row_data =[
@@ -182,6 +188,7 @@ class Policy(nn.Module):
                 wm_metrics.get('goal_loss', 0),                   # goalLoss
                 wm_metrics.get('team_loss', 0),                   # teamLoss
                 wm_metrics.get('item_loss', 0),                   # itemLoss
+                wm_metrics.get('grid_loss', 0),                   # gridLoss
                 wm_metrics.get('curiosity_loss', 0),              # curiosityLoss
                 dream_metrics.get('actor_loss', 0),               # actorLoss
                 dream_metrics.get('entropies', 0),                # entropies
@@ -201,7 +208,7 @@ class Policy(nn.Module):
                 writer.writerow(row_data)
 
             # --- Checkpoint Saving ---
-            if episode > 0 and episode % 3 == 0:
+            if episode > 0 and episode % self.checkpoint_interval == 0:
                 score_int = int(avg_score) if avg_score is not None else 0
                 filename = f"pokemon_model_R{score_int}_G{self.dreamer.total_num_updates}.pt"
                 path = os.path.join("checkpoints", filename)
@@ -225,25 +232,29 @@ class Policy(nn.Module):
         rams = []
         team_levels = []
         item_counts = []
+        grids = []
         for env in self.envs:
             obs, info = env.reset()
             observations.append(obs)
             rams.append(np.array(info["milestones"], dtype=np.float32))
             team_levels.append(np.array(info["team_levels"], dtype=np.float32))
             item_counts.append(np.array(info["item_counts"], dtype=np.float32))
+            grids.append(np.array(info["grid"], dtype=np.float32))
             
         while min(episodes_completed) < num_episodes:
             obs_tensor = (torch.from_numpy(np.array(observations)).float() / 255.0).to(self.device)
             ram_tensor = torch.from_numpy(np.array(rams)).float().to(self.device)
             team_tensor = torch.from_numpy(np.array(team_levels)).float().to(self.device)
             item_tensor = torch.from_numpy(np.array(item_counts)).float().to(self.device)
+            grid_tensor = torch.from_numpy(np.array(grids)).float().to(self.device)
             
             with torch.no_grad():
                 encoded_img = self.dreamer.image_encoder(obs_tensor)
                 encoded_goal = self.dreamer.goal_encoder(ram_tensor)
                 encoded_team = self.dreamer.team_encoder(team_tensor / 100.0)
                 encoded_item = self.dreamer.item_encoder(item_tensor / 10.0)
-                encoded_obs = torch.cat([encoded_img, encoded_goal, encoded_team, encoded_item], dim=-1)
+                encoded_grid = self.dreamer.grid_encoder(grid_tensor)
+                encoded_obs = torch.cat([encoded_img, encoded_goal, encoded_team, encoded_item, encoded_grid], dim=-1)
                 
                 recurrent_state = self.dreamer.recurrentModel(recurrent_state, latent_state, action_onehot)
                 latent_state, _ = self.dreamer.posteriorNet(torch.cat((recurrent_state, encoded_obs), -1))
@@ -261,6 +272,7 @@ class Policy(nn.Module):
                     rams[i] = np.array(info["milestones"], dtype=np.float32)
                     team_levels[i] = np.array(info["team_levels"], dtype=np.float32)
                     item_counts[i] = np.array(info["item_counts"], dtype=np.float32)
+                    grids[i] = np.array(info["grid"], dtype=np.float32)
                     current_rewards[i] += reward
                     steps[i] += 1
                     
@@ -277,6 +289,7 @@ class Policy(nn.Module):
                             rams[i] = np.array(info["milestones"], dtype=np.float32)
                             team_levels[i] = np.array(info["team_levels"], dtype=np.float32)
                             item_counts[i] = np.array(info["item_counts"], dtype=np.float32)
+                            grids[i] = np.array(info["grid"], dtype=np.float32)
                             current_rewards[i] = 0.0
                             steps[i] = 0
                             recurrent_state[i] = torch.zeros(self.recurrent_dim, device=self.device)

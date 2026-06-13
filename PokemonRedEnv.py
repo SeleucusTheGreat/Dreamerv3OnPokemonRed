@@ -59,7 +59,7 @@ class PokemonRedEnv(gym.Env):
         self.pyboy.set_emulation_speed(speed) # 0 = Unlimited speed for training
         
         # Budget Constants
-        self.init_steps = 10000
+        self.init_steps = 20000
 
 
         # --- REWARDS CONSTANTS ---
@@ -214,7 +214,24 @@ class PokemonRedEnv(gym.Env):
         
         coord = self._get_current_position()
         map_id, x, y = coord
+        
+        # --- NEW: Check for map transition curiosity bonus (+1.0 once per episode) ---
+        curiosity_bonus = 0.0
+        monitored_maps = {2, 3, 51, 54, 5, 59, 6, 49}
+        if map_id in monitored_maps and map_id not in self.curiosity_triggered_maps:
+            curiosity_bonus = 1.0
+            self.curiosity_triggered_maps.add(map_id)
+            if self.verbose:
+                print(f"[CURIOSITY BONUS] +1.0 awarded for transitioning to Map ID: {map_id}")
+
         self.visited_maps.add(map_id)
+
+        # Coordinate-discovery curiosity (0.01 for new visited tile/coordinate) + map transition bonus
+        if coord not in self.visited_tiles:
+            self.visited_tiles.add(coord)
+            curiosity = 0.01 + curiosity_bonus
+        else:
+            curiosity = 0.0 + curiosity_bonus
 
         # EVENT REWARD 
         current_active_events = self._get_active_events()
@@ -280,13 +297,15 @@ class PokemonRedEnv(gym.Env):
         
         info = {
             "coord": coord, 
+            "curiosity": curiosity,
             "steps": self.current_step, 
             "limit": self.max_step_limit,
             "events": current_events,
             "total_level": total_level,
             "milestones": self._get_milestones(),
             "team_levels": self._get_team_levels(),
-            "item_counts": self._get_item_counts()
+            "item_counts": self._get_item_counts(),
+            "grid": self._get_grid_vector()
         }
         
         return obs, step_reward, terminated, False, info
@@ -303,12 +322,23 @@ class PokemonRedEnv(gym.Env):
         
         # Reset tracking coordinates cleanly
         self.visited_maps = set()
+        self.visited_tiles = set()
+        
+        # --- NEW: Track map curiosity triggers for the current episode ---
+        self.curiosity_triggered_maps = set()
     
         self.pyboy.tick()
         
         start_coord = self._get_current_position()
-        self.visited_maps.add(start_coord[0]) 
+        start_map = start_coord[0]
+        self.visited_maps.add(start_map) 
+        self.visited_tiles.add(start_coord)
         
+        # Avoid awarding curiosity for simply spawning on a monitored map
+        monitored_maps = {2, 3, 51, 54, 5, 59, 6, 49}
+        if start_map in monitored_maps:
+            self.curiosity_triggered_maps.add(start_map)
+
         # Initial Party and Event Baseline
         self.last_active_events = self._get_active_events()
         self.max_events = len(self.last_active_events)
@@ -322,11 +352,13 @@ class PokemonRedEnv(gym.Env):
         
         info = {
             "coord": start_coord,
+            "curiosity": 0.01,  # First tile is starting tile
             "events": self.max_events,
             "total_level": total_level,
             "milestones": milestones,
             "team_levels": self._get_team_levels(),
-            "item_counts": self._get_item_counts()
+            "item_counts": self._get_item_counts(),
+            "grid": self._get_grid_vector()
         }
         return self._get_obs(), info
 
@@ -360,6 +392,15 @@ class PokemonRedEnv(gym.Env):
             exit_forest, pokeball
         ]
 
+    def _get_grid_vector(self):
+        coord = self._get_current_position()
+        map_id, x, y = coord
+        grid = []
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                grid.append(1.0 if (map_id, x + dx, y + dy) in self.visited_tiles else 0.0)
+        return np.array(grid, dtype=np.float32)
+
 class RotatingPokemonRedEnv(PokemonRedEnv):
     def __init__(self, rom_path, state_paths, env_id, **kwargs):
         if isinstance(state_paths, str):
@@ -386,10 +427,10 @@ def create_envs(num_envs, rom_path, state_dir="StartingFiles", wind="null"):
     print(f"Initializing {num_envs} PyBoy Environments...")
     
     for i in range(num_envs):
-        if i < 3:
+        if i < 4:
             paths = [os.path.join(state_dir, start_state)]
         else:
-            start_idx = (i - 3) % len(other_states)
+            start_idx = (i - 4) % len(other_states)
             rotated_states = other_states[start_idx:] + other_states[:start_idx]
             paths = [os.path.join(state_dir, s) for s in rotated_states]
         
