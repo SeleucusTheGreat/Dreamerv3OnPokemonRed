@@ -697,7 +697,7 @@ class Dreamer:
         self.grid_out_dim = 128
         self.enconder_output_size = 1024 + self.ram_out_dim + self.team_out_dim + self.item_out_dim + self.grid_out_dim
         
-        self.entropy_scale = 0.001
+        self.entropy_scale = 0.0015
         self.number_of_sequences = number_of_sequences 
         self.steps_per_sequence = steps_per_sequence
         self.buffer_capacity = buffer_size
@@ -1075,7 +1075,7 @@ class Dreamer:
         curiosity_advantages = (curiosity_lambda_values - online_curiosity_values[:, :-1].detach()) / curiosity_denominator
         
         # Combine extrinsic and intrinsic exploration advantages
-        combined_advantages = reward_advantages  + self.curiosity_scale * curiosity_advantages
+        combined_advantages = (1.0 - self.curiosity_scale) * reward_advantages + self.curiosity_scale * curiosity_advantages
 
         # --- ACTOR LOSS ---
         actor_loss_per_step = combined_advantages.detach() * log_probabilities + self.entropy_scale * entropies

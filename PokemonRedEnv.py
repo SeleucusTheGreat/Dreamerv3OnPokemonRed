@@ -98,7 +98,7 @@ class PokemonRedEnv(gym.Env):
         self.last_party_count = 0
         self.level_reward_decay_rate = 0.85
         self.episode_level_ups = 0 
-
+        self.brock_defeated = False
     # ==========================================================
     # EMULATOR & RAM HELPERS
     # ==========================================================
@@ -148,11 +148,11 @@ class PokemonRedEnv(gym.Env):
         return (map_id, x, y)
 
     def _get_active_events(self):
-        """Reads the event RAM range and returns a set of (address, bit) pairs for all bits set to 1."""
         active_events = set()
-        for addr in range(self.ram_events_start, self.RAM_EVENTS_END):
-            val = self.pyboy.memory[addr]
+        block = self.pyboy.memory[self.ram_events_start:self.RAM_EVENTS_END]  # one bulk read
+        for offset, val in enumerate(block):
             if val:
+                addr = self.ram_events_start + offset
                 for i in range(8):
                     if val & (1 << i):
                         if addr == 0xD7BF and i == 0:
@@ -208,6 +208,7 @@ class PokemonRedEnv(gym.Env):
     # ==========================================================
 
     def step(self, action):
+        brock_before = self.brock_defeated
         self._apply_action(action)
         self.current_step += 1
         step_reward = 0.000
@@ -253,6 +254,17 @@ class PokemonRedEnv(gym.Env):
                 print(f"[EVENT] +{event_reward_gain:.3f} | Budget: {self.max_step_limit}")
 
         self.last_active_events = current_active_events
+
+        # Check for Brock defeat milestone reward
+        brock_after = (self.pyboy.memory[0xD356] & 1) == 1
+        if not brock_before and brock_after:
+            self.brock_defeated = True
+            # Beating Brock should yield +200 rather than the normal +50.
+            # Since the event reward gain already added +50 (or will add +50),
+            # we add +150 to make the total +200.
+            step_reward += 150.0
+            if self.verbose:
+                print(f"[BROCK DEFEAT] +150.0 added (total 200.0 for beating Brock)")
 
         # PARTY HEALING REWARD
         total_level, hp_fraction_sum, party_count = self._get_party_info()
@@ -347,6 +359,7 @@ class PokemonRedEnv(gym.Env):
         self.last_party_count = party_count
         self.max_level_reward = self._calculate_level_reward(total_level)
         self.has_obtained_pokeball = self._has_pokeball()
+        self.brock_defeated = (self.pyboy.memory[0xD356] & 1) == 1
         
         milestones = self._get_milestones()
         
@@ -427,10 +440,10 @@ def create_envs(num_envs, rom_path, state_dir="StartingFiles", wind="null"):
     print(f"Initializing {num_envs} PyBoy Environments...")
     
     for i in range(num_envs):
-        if i < 4:
+        if i < 3:
             paths = [os.path.join(state_dir, start_state)]
         else:
-            start_idx = (i - 4) % len(other_states)
+            start_idx = (i - 3) % len(other_states)
             rotated_states = other_states[start_idx:] + other_states[:start_idx]
             paths = [os.path.join(state_dir, s) for s in rotated_states]
         

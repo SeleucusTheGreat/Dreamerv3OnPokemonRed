@@ -15,7 +15,7 @@ class Policy(nn.Module):
         self.device = device
         self.envs = envs
         self.action_dim = envs[0].action_space.n 
-        self.buffer_size = 1000000
+        self.buffer_size = 1500000
         self.recurrent_dim = 1024 
         self.rows = 32           
         self.cols = 32
@@ -300,4 +300,5 @@ class Policy(nn.Module):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True   # your input shapes are fixed (64x64), so autotuning pays off
