@@ -261,10 +261,10 @@ class PokemonRedEnv(gym.Env):
             self.brock_defeated = True
             # Beating Brock should yield +200 rather than the normal +50.
             # Since the event reward gain already added +50 (or will add +50),
-            # we add +150 to make the total +200.
-            step_reward += 150.0
+            # we add +50 to make the total +200.
+            step_reward += 50.0
             if self.verbose:
-                print(f"[BROCK DEFEAT] +150.0 added (total 200.0 for beating Brock)")
+                print(f"[BROCK DEFEAT] +50.0 added (total 100.0 for beating Brock)")
 
         # PARTY HEALING REWARD
         total_level, hp_fraction_sum, party_count = self._get_party_info()
