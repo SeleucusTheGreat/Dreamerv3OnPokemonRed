@@ -319,8 +319,14 @@ class PokemonRedEnv(gym.Env):
         brock_before = self.brock_defeated
         self._apply_action(action)
         self.current_step += 1
-        step_reward = 0.000
-        
+        # Reward is split into two streams that are summed for the env return:
+        #   sparse_reward   -> memory-tied events (event flags, Brock, first pokeball).
+        #                      These correspond to changes in the LTM reward memory and
+        #                      are the ones gated by the LTM predictor during the dream.
+        #   standard_reward -> non-memory events (healing, level-ups).
+        sparse_reward = 0.000
+        standard_reward = 0.000
+
         coord = self._get_current_position()
         map_id, x, y = coord
         
@@ -352,7 +358,7 @@ class PokemonRedEnv(gym.Env):
 
             self.max_step_limit += (new_events * self.step_increase)
             self.max_events = current_events
-            step_reward += event_reward_gain
+            sparse_reward += event_reward_gain
 
             if self.verbose:
                 print(f"[EVENT] +{event_reward_gain:.3f} | Budget: {self.max_step_limit}")
@@ -366,7 +372,7 @@ class PokemonRedEnv(gym.Env):
             # Beating Brock should yield +200 rather than the normal +50.
             # Since the event reward gain already added +50 (or will add +50),
             # we add +50 to make the total +200.
-            step_reward += 50.0
+            sparse_reward += 50.0
             if self.verbose:
                 print(f"[BROCK DEFEAT] +50.0 added (total 100.0 for beating Brock)")
 
@@ -377,7 +383,7 @@ class PokemonRedEnv(gym.Env):
             if self.last_hp_fraction_sum > 0.0:  # Avoid healing reward on respawn
                 heal_gain = hp_fraction_sum - self.last_hp_fraction_sum
                 heal_reward = self.reward_heal_mult * heal_gain
-                step_reward += heal_reward
+                standard_reward += heal_reward
                 if self.verbose:
                     print(f"[HEAL] +{heal_reward:.3f} | HP recovered: {heal_gain:.2f}")
 
@@ -391,7 +397,7 @@ class PokemonRedEnv(gym.Env):
             
             # Decay 
             decayed_lvl_gain = lvl_gain * (self.level_reward_decay_rate ** self.episode_level_ups)
-            step_reward += decayed_lvl_gain
+            standard_reward += decayed_lvl_gain
             
             self.max_level_reward = current_lvl_val
             self.episode_level_ups += 1  
@@ -402,18 +408,23 @@ class PokemonRedEnv(gym.Env):
         # ITEM REWARD
         if not self.has_obtained_pokeball:
             if self._has_pokeball():
-                self.has_obtained_pokeball = True 
-                step_reward += 50.0
+                self.has_obtained_pokeball = True
+                sparse_reward += 50.0
                 if self.verbose:
                     print("[ITEM] +50.0 | Obtained first Pokéball!")
+
+        # Total env reward is the sum of the two streams (unchanged externally).
+        step_reward = sparse_reward + standard_reward
 
         # Termination & Obs
         terminated = self.current_step >= self.max_step_limit
         obs = self._get_obs()
-        
+
         info = {
-            "coord": coord, 
+            "coord": coord,
             "curiosity": curiosity,
+            "sparse_reward": sparse_reward,
+            "standard_reward": standard_reward,
             "steps": self.current_step, 
             "limit": self.max_step_limit,
             "events": current_events,

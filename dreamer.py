@@ -375,20 +375,26 @@ class Buffer(object):
         self.item_counts = torch.empty((capacity, item_dim), dtype=torch.float32, device='cpu')
         self.team_levels = torch.empty((capacity, team_level_dim), dtype=torch.float32, device='cpu')
         self.actions = torch.empty((capacity, actionSize), dtype=torch.float32, device='cpu')
-        self.rewards = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
+        # Reward is stored as two streams (summed only when an env total is needed):
+        #   sparse_rewards   -> memory-tied events (LTM-gated in the dream)
+        #   standard_rewards -> non-memory events (healing, level-ups)
+        self.sparse_rewards = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
+        self.standard_rewards = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
         self.curiosities = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
 
         self.index = 0
         self.full = False
 
-    def add(self, observation, ltm_reward, ltm_map, item_count, team_level, action, reward, curiosity):
+    def add(self, observation, ltm_reward, ltm_map, item_count, team_level, action,
+            sparse_reward, standard_reward, curiosity):
         self.observations[self.index] = torch.as_tensor(observation, dtype=torch.uint8)
         self.ltm_rewards[self.index] = torch.as_tensor(ltm_reward, dtype=torch.uint8)
         self.ltm_maps[self.index] = torch.as_tensor(ltm_map, dtype=torch.uint8)
         self.item_counts[self.index] = torch.as_tensor(item_count, dtype=torch.float32)
         self.team_levels[self.index] = torch.as_tensor(team_level, dtype=torch.float32)
         self.actions[self.index] = torch.as_tensor(action, dtype=torch.float32)
-        self.rewards[self.index] = torch.as_tensor(reward, dtype=torch.float32)
+        self.sparse_rewards[self.index] = torch.as_tensor(sparse_reward, dtype=torch.float32)
+        self.standard_rewards[self.index] = torch.as_tensor(standard_reward, dtype=torch.float32)
         self.curiosities[self.index] = torch.as_tensor(curiosity, dtype=torch.float32)
 
         self.index = (self.index + 1) % self.capacity
@@ -431,9 +437,10 @@ class Buffer(object):
             "ltm_maps":     self.ltm_maps[sampleIndex].to(self.device, non_blocking=True).float(),
             "item_counts":  self.item_counts[sampleIndex].to(self.device, non_blocking=True),
             "team_levels":  self.team_levels[sampleIndex].to(self.device, non_blocking=True),
-            "actions":      self.actions[sampleIndex].to(self.device, non_blocking=True),
-            "rewards":      self.rewards[sampleIndex].to(self.device, non_blocking=True),
-            "curiosities":  self.curiosities[sampleIndex].to(self.device, non_blocking=True),
+            "actions":          self.actions[sampleIndex].to(self.device, non_blocking=True),
+            "sparse_rewards":   self.sparse_rewards[sampleIndex].to(self.device, non_blocking=True),
+            "standard_rewards": self.standard_rewards[sampleIndex].to(self.device, non_blocking=True),
+            "curiosities":      self.curiosities[sampleIndex].to(self.device, non_blocking=True),
             "index":        sampleIndex.to(self.device, non_blocking=True),
         }
 
@@ -446,7 +453,8 @@ class Buffer(object):
             'item_counts': self.item_counts[:limit],
             'team_levels': self.team_levels[:limit],
             'actions': self.actions[:limit],
-            'rewards': self.rewards[:limit],
+            'sparse_rewards': self.sparse_rewards[:limit],
+            'standard_rewards': self.standard_rewards[:limit],
             'curiosities': self.curiosities[:limit],
             'index': self.index,
             'full': self.full,
@@ -456,7 +464,7 @@ class Buffer(object):
         ckpt = torch.load(path, map_location='cpu')
         n = min(ckpt['observations'].shape[0], self.capacity)
         for name in ('observations', 'ltm_rewards', 'ltm_maps', 'item_counts',
-                     'team_levels', 'actions', 'rewards', 'curiosities'):
+                     'team_levels', 'actions', 'sparse_rewards', 'standard_rewards', 'curiosities'):
             if name in ckpt:
                 getattr(self, name)[:n] = ckpt[name][:n]
             else:
@@ -508,7 +516,7 @@ class Dreamer:
         self.enconder_output_size = (self.image_out + self.teamitem_out
                                      + self.ltm_reward_out + self.ltm_map_out)
 
-        self.entropy_scale = 0.0003
+        self.entropy_scale = 0.001
         self.number_of_sequences = number_of_sequences
         self.steps_per_sequence = steps_per_sequence
         self.buffer_capacity = buffer_size
@@ -541,7 +549,13 @@ class Dreamer:
         self.ltm_map_encoder = LongTermMapEncoder(LTM_MAP_DIM, self.ltm_map_out, hidden=self.mlp_dim).to(self.device)
 
         # --- Predictors (latent -> observation components) ---
-        self.rewardPredictor = EnsembleRewardPredictor(self.concatenated_dim, num_heads=3, mlp_dim=self.mlp_dim).to(self.device)
+        # Reward prediction is split into two predictors for one conceptual reward:
+        #   sparseRewardPredictor   -> memory-tied events (LTM-gated in the dream)
+        #   standardRewardPredictor -> non-memory events (healing, level-ups)
+        # Their decoded outputs are summed; the sum feeds the single (shared) reward
+        # critic and dynamic normalizer exactly as the original single predictor did.
+        self.sparseRewardPredictor = EnsembleRewardPredictor(self.concatenated_dim, num_heads=3, mlp_dim=self.mlp_dim).to(self.device)
+        self.standardRewardPredictor = EnsembleRewardPredictor(self.concatenated_dim, num_heads=3, mlp_dim=self.mlp_dim).to(self.device)
         self.curiosityPredictor = CuriosityPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
         self.teamitemPredictor = TeamItemPredictor(self.concatenated_dim, self.team_dim + self.item_dim, hidden=self.mlp_dim).to(self.device)
         self.ltm_reward_predictor = LongTermMemoryPredictor(self.concatenated_dim, LTM_REWARD_DIM, hidden=self.mlp_dim).to(self.device)
@@ -583,7 +597,8 @@ class Dreamer:
             list(self.recurrentModel.parameters())
             + list(self.posteriorNet.parameters())
             + list(self.priorNet.parameters())
-            + list(self.rewardPredictor.parameters())
+            + list(self.sparseRewardPredictor.parameters())
+            + list(self.standardRewardPredictor.parameters())
             + list(self.image_encoder.parameters())
             + list(self.teamitem_encoder.parameters())
             + list(self.ltm_reward_encoder.parameters())
@@ -700,15 +715,27 @@ class Dreamer:
         scaled_bt_loss = beta_BT * (invariance_loss + alpha * redundancy_loss)
 
         # ----------------------------------------------------
-        # REWARD (ensemble) + AUXILIARY PREDICTIONS
+        # REWARD (two ensembles) + AUXILIARY PREDICTIONS
+        # One conceptual reward, predicted as sparse + standard streams. Each ensemble
+        # is trained on its own target; the losses are summed and added to the world
+        # model loss just like the original single reward loss.
         # ----------------------------------------------------
-        reward_logits_ensemble = self.rewardPredictor(full_states)  # [num_heads, B, T-1, num_bins]
-        with torch.no_grad():
-            target_rewards = self.two_hot.encode(batch_data["rewards"][:, :-1].squeeze(-1))
-        reward_loss = 0.0
-        for h in range(self.rewardPredictor.num_heads):
-            reward_loss += -torch.mean(torch.sum(target_rewards * torch.log_softmax(reward_logits_ensemble[h], dim=-1), dim=-1)) * 100
-        reward_loss = reward_loss / self.rewardPredictor.num_heads
+        def _ensemble_reward_loss(predictor, logits_ensemble, target_scalar):
+            with torch.no_grad():
+                target_two_hot = self.two_hot.encode(target_scalar.squeeze(-1))
+            loss = 0.0
+            for h in range(predictor.num_heads):
+                loss += -torch.mean(torch.sum(
+                    target_two_hot * torch.log_softmax(logits_ensemble[h], dim=-1), dim=-1)) * 100
+            return loss / predictor.num_heads
+
+        sparse_logits_ensemble = self.sparseRewardPredictor(full_states)      # [num_heads, B, T-1, num_bins]
+        standard_logits_ensemble = self.standardRewardPredictor(full_states)
+        sparse_reward_loss = _ensemble_reward_loss(
+            self.sparseRewardPredictor, sparse_logits_ensemble, batch_data["sparse_rewards"][:, :-1])
+        standard_reward_loss = _ensemble_reward_loss(
+            self.standardRewardPredictor, standard_logits_ensemble, batch_data["standard_rewards"][:, :-1])
+        reward_loss = sparse_reward_loss + standard_reward_loss
 
         # Combined team+item prediction (single decoder).
         pred_teamitem = self.teamitemPredictor(full_states)
@@ -767,6 +794,8 @@ class Dreamer:
             "world_model_loss": world_model_loss.item(),
             "reconstruction_loss": scaled_bt_loss.item(),
             "reward_loss": reward_loss.item(),
+            "sparse_reward_loss": sparse_reward_loss.item(),
+            "standard_reward_loss": standard_reward_loss.item(),
             "kl_loss": kl_loss.item(),
             "teamitem_loss": teamitem_loss.item(),
             "ltm_reward_loss": ltm_reward_loss.item(),
@@ -826,14 +855,19 @@ class Dreamer:
         entropies = torch.stack(entropies, dim=1)
         actions_stack = torch.stack(actions_stack, dim=1)
 
-        # --- Predicted rewards (ensemble mean) and curiosity ---
+        # --- Predicted rewards (ensemble means) and curiosity ---
         with torch.no_grad():
             imagined_steps = full_states[:, 1:]
-            reward_logits_ensemble = self.rewardPredictor(imagined_steps)
-            decoded_rewards = torch.stack(
-                [self.two_hot.decode(reward_logits_ensemble[h]).squeeze(-1)
-                 for h in range(self.rewardPredictor.num_heads)], dim=0)
-            predicted_rewards = decoded_rewards.mean(dim=0)
+
+            def _ensemble_mean(predictor, logits_ensemble):
+                return torch.stack(
+                    [self.two_hot.decode(logits_ensemble[h]).squeeze(-1)
+                     for h in range(predictor.num_heads)], dim=0).mean(dim=0)
+
+            predicted_sparse = _ensemble_mean(self.sparseRewardPredictor,
+                                              self.sparseRewardPredictor(imagined_steps))
+            predicted_standard = _ensemble_mean(self.standardRewardPredictor,
+                                                self.standardRewardPredictor(imagined_steps))
 
             curiosity_logits = self.curiosityPredictor(imagined_steps)
             predicted_curiosity = self.two_hot.decode(curiosity_logits).squeeze(-1)
@@ -842,9 +876,13 @@ class Dreamer:
             # Within a single dream trajectory, only credit the FIRST occurrence
             # of each reward-event type and each map type. Repeats are zeroed so
             # the agent can't farm the same reward/curiosity by sitting still.
+            # IMPORTANT: only the SPARSE (memory-tied) reward is gated by the LTM
+            # reward predictor. Standard rewards (healing, level-ups) are not memory
+            # events and can legitimately recur, so they are added ungated.
             reward_type = self.ltm_reward_predictor(imagined_steps).argmax(dim=-1)  # [N, T]
             map_type = self.ltm_map_predictor(imagined_steps).argmax(dim=-1)        # [N, T]
-            predicted_rewards = predicted_rewards * self._first_occurrence_mask(reward_type)
+            predicted_sparse = predicted_sparse * self._first_occurrence_mask(reward_type)
+            predicted_rewards = predicted_sparse + predicted_standard
             predicted_curiosity = predicted_curiosity * self._first_occurrence_mask(map_type)
 
         imagined_states = full_states.detach()
@@ -1005,11 +1043,13 @@ class Dreamer:
                     current_rewards[i] += reward
                     maps_visited[i].add(next_info["coord"][0])
                     curiosity = next_info.get("curiosity", 0.0)
+                    sparse_reward = next_info.get("sparse_reward", 0.0)
+                    standard_reward = next_info.get("standard_reward", 0.0)
 
                     local_buffers[i].append((
                         observations[i].copy(), ltm_rewards[i].copy(), ltm_maps[i].copy(),
                         item_counts[i].copy(), team_levels[i].copy(),
-                        actions_for_buffer[i].copy(), reward, curiosity))
+                        actions_for_buffer[i].copy(), sparse_reward, standard_reward, curiosity))
 
                     observations[i] = next_observation
                     ltm_rewards[i] = np.array(next_info["ltm_reward"], dtype=np.float32)
@@ -1051,7 +1091,7 @@ class Dreamer:
     # CHECKPOINTING (clean dict-based save/load with graceful fallback)
     # ------------------------------------------------------
     _CHECKPOINT_MODULES = [
-        'recurrentModel', 'posteriorNet', 'priorNet', 'rewardPredictor',  # 'curiosityPredictor',  # fresh init: switched to symlog two-hot
+        'recurrentModel', 'posteriorNet', 'priorNet', 'sparseRewardPredictor', 'standardRewardPredictor',  # 'curiosityPredictor',  # fresh init: switched to symlog two-hot
         'image_encoder', 'teamitem_encoder', 'ltm_reward_encoder', 'ltm_map_encoder',
         'teamitemPredictor', 'ltm_reward_predictor', 'ltm_map_predictor', 'projector',
         'actor', 'critic', 'ema_critic', 'curiosity_critic', 'ema_curiosity_critic',
