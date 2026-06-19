@@ -6,6 +6,131 @@ import os
 from pyboy import PyBoy
 from pyboy.utils import WindowEvent
 
+# ==========================================================
+# LONG-TERM MEMORY / MAP / GRID DIMENSIONS (whole-game scope)
+# ==========================================================
+# Event-flag RAM region: bytes [0xD73E, 0xD860) = 290 bytes = 2320 bits.
+# This is the *whole-game* event memory (every story/script flag).
+RAM_EVENTS_REGION_START = 0xD73E
+RAM_EVENTS_REGION_END = 0xD860            # exclusive
+NUM_EVENT_BITS = (RAM_EVENTS_REGION_END - RAM_EVENTS_REGION_START) * 8  # 2320
+LTM_REWARD_DIM = NUM_EVENT_BITS + 1       # +1 pokeball flag = 2321
+
+# Critical-path maps for the WHOLE game (decimal map IDs, progression order).
+# First entry to any of these (per episode) grants a one-shot curiosity bonus, and the
+# set of visited monitored maps forms the long-term map vector (LTM_MAP_DIM).
+MONITORED_MAPS = [
+    # --- Pallet -> Pewter (Brock) ---
+    12,    # ROUTE_1
+    1,     # VIRIDIAN_CITY
+    13,    # ROUTE_2
+    51,    # VIRIDIAN_FOREST
+    2,     # PEWTER_CITY
+    54,    # PEWTER_GYM            (Brock, Boulder Badge)
+    # --- Route 3 -> Mt. Moon -> Cerulean (Misty) ---
+    14,    # ROUTE_3
+    59,    # MT_MOON_1F
+    60,    # MT_MOON_B1F
+    61,    # MT_MOON_B2F
+    15,    # ROUTE_4
+    3,     # CERULEAN_CITY
+    65,    # CERULEAN_GYM          (Misty, Cascade Badge)
+    35,    # ROUTE_24             (Nugget Bridge)
+    36,    # ROUTE_25             (Bill -> S.S. Ticket)
+    # --- Cerulean -> Vermilion (Surge) ---
+    16,    # ROUTE_5
+    17,    # ROUTE_6
+    5,     # VERMILION_CITY
+    95,    # SS_ANNE_1F
+    96,    # SS_ANNE_2F
+    101,   # SS_ANNE_CAPTAINS_ROOM (HM01 Cut)
+    92,    # VERMILION_GYM         (Lt. Surge, Thunder Badge)
+    # --- Route 9/10 -> Rock Tunnel -> Lavender ---
+    20,    # ROUTE_9
+    21,    # ROUTE_10
+    82,    # ROCK_TUNNEL_1F
+    232,   # ROCK_TUNNEL_B1F
+    4,     # LAVENDER_TOWN
+    # --- Lavender -> Celadon (Erika) -> Rocket Hideout ---
+    19,    # ROUTE_8
+    18,    # ROUTE_7
+    6,     # CELADON_CITY
+    134,   # CELADON_GYM           (Erika, Rainbow Badge)
+    135,   # GAME_CORNER           (Rocket Hideout entrance)
+    199,   # ROCKET_HIDEOUT_B1F
+    200,   # ROCKET_HIDEOUT_B2F
+    201,   # ROCKET_HIDEOUT_B3F
+    202,   # ROCKET_HIDEOUT_B4F    (Silph Scope)
+    # --- Pokemon Tower (Poke Flute) ---
+    142,   # POKEMON_TOWER_1F
+    143,   # POKEMON_TOWER_2F
+    144,   # POKEMON_TOWER_3F
+    145,   # POKEMON_TOWER_4F
+    146,   # POKEMON_TOWER_5F
+    147,   # POKEMON_TOWER_6F
+    148,   # POKEMON_TOWER_7F      (Mr. Fuji -> Poke Flute)
+    # --- Saffron -> Silph Co. (Giovanni) -> Sabrina ---
+    10,    # SAFFRON_CITY
+    181,   # SILPH_CO_1F
+    207,   # SILPH_CO_2F
+    208,   # SILPH_CO_3F
+    209,   # SILPH_CO_4F
+    210,   # SILPH_CO_5F
+    211,   # SILPH_CO_6F
+    212,   # SILPH_CO_7F
+    213,   # SILPH_CO_8F
+    233,   # SILPH_CO_9F
+    234,   # SILPH_CO_10F
+    235,   # SILPH_CO_11F          (Giovanni -> Master Ball)
+    178,   # SAFFRON_GYM           (Sabrina, Marsh Badge)
+    # --- Route 12-15 -> Fuchsia (Koga) -> Safari Zone (Surf/Strength) ---
+    23,    # ROUTE_12
+    24,    # ROUTE_13
+    25,    # ROUTE_14
+    26,    # ROUTE_15
+    7,     # FUCHSIA_CITY
+    157,   # FUCHSIA_GYM           (Koga, Soul Badge)
+    220,   # SAFARI_ZONE_CENTER
+    217,   # SAFARI_ZONE_EAST
+    218,   # SAFARI_ZONE_NORTH
+    219,   # SAFARI_ZONE_WEST
+    222,   # SAFARI_ZONE_SECRET_HOUSE (HM03 Surf; Gold Teeth -> HM04 Strength)
+    # --- Surf to Cinnabar -> Pokemon Mansion (Secret Key) -> Blaine ---
+    30,    # ROUTE_19
+    31,    # ROUTE_20
+    8,     # CINNABAR_ISLAND
+    165,   # POKEMON_MANSION_1F
+    214,   # POKEMON_MANSION_2F
+    215,   # POKEMON_MANSION_3F
+    216,   # POKEMON_MANSION_B1F   (Secret Key)
+    166,   # CINNABAR_GYM          (Blaine, Volcano Badge)
+    # --- Viridian Gym (Giovanni) -> Victory Road -> Elite Four ---
+    45,    # VIRIDIAN_GYM          (Giovanni, Earth Badge)
+    33,    # ROUTE_22
+    34,    # ROUTE_23
+    108,   # VICTORY_ROAD_1F
+    194,   # VICTORY_ROAD_2F
+    198,   # VICTORY_ROAD_3F
+    9,     # INDIGO_PLATEAU
+    174,   # INDIGO_PLATEAU_LOBBY
+    245,   # LORELEIS_ROOM
+    246,   # BRUNOS_ROOM
+    247,   # AGATHAS_ROOM
+    113,   # LANCES_ROOM
+    120,   # CHAMPIONS_ROOM        (rival, final battle)
+    118,   # HALL_OF_FAME          (game complete)
+]
+LTM_MAP_DIM = len(MONITORED_MAPS)
+MONITORED_MAPS_SET = set(MONITORED_MAPS)
+
+# Egocentric visited-tiles grid (kept from the working project).
+GRID_RADIUS = 4
+GRID_DIM = (2 * GRID_RADIUS + 1) ** 2     # 81
+
+# Per-map curiosity bonus granted on first entry to a monitored map (matches the
+# value the world model decodes as the analytic map-visit signal, if needed).
+MAP_CURIOSITY_BONUS = 1.0
+
 
 class PokemonRedEnv(gym.Env):
 
@@ -43,11 +168,15 @@ class PokemonRedEnv(gym.Env):
         self.verbose = verbose
         self.advanced = advanced 
         self.has_obtained_pokeball = False
-        
+
         self.visited_maps = set()
-        
+
         # Start counting events later in memory if using the advanced start
         self.ram_events_start = 0xD74B if self.advanced else self.RAM_EVENTS_START
+
+        # Whole-game long-term event memory: snapshot of the start-state event bits, used
+        # to mask out flags that were already set so the LTM vector reflects *new* progress.
+        self.start_event_bits = np.zeros(NUM_EVENT_BITS, dtype=np.float32)
 
         # Initialize Emulator
         self.pyboy = PyBoy(
@@ -216,14 +345,13 @@ class PokemonRedEnv(gym.Env):
         coord = self._get_current_position()
         map_id, x, y = coord
         
-        # --- NEW: Check for map transition curiosity bonus (+1.0 once per episode) ---
+        # --- Map-transition curiosity bonus (+1.0 once per episode), WHOLE-GAME scope ---
         curiosity_bonus = 0.0
-        monitored_maps = {2, 3, 51, 54, 5, 59, 6, 49}
-        if map_id in monitored_maps and map_id not in self.curiosity_triggered_maps:
-            curiosity_bonus = 1.0
+        if map_id in MONITORED_MAPS_SET and map_id not in self.curiosity_triggered_maps:
+            curiosity_bonus = MAP_CURIOSITY_BONUS
             self.curiosity_triggered_maps.add(map_id)
             if self.verbose:
-                print(f"[CURIOSITY BONUS] +1.0 awarded for transitioning to Map ID: {map_id}")
+                print(f"[CURIOSITY BONUS] +{MAP_CURIOSITY_BONUS} awarded for transitioning to Map ID: {map_id}")
 
         self.visited_maps.add(map_id)
 
@@ -315,11 +443,13 @@ class PokemonRedEnv(gym.Env):
             "events": current_events,
             "total_level": total_level,
             "milestones": self._get_milestones(),
+            "ltm_reward": self._get_ltm_reward(),
+            "ltm_map": self._get_ltm_map(),
             "team_levels": self._get_team_levels(),
             "item_counts": self._get_item_counts(),
             "grid": self._get_grid_vector()
         }
-        
+
         return obs, step_reward, terminated, False, info
 
     def reset(self, seed=None, options=None):
@@ -347,9 +477,12 @@ class PokemonRedEnv(gym.Env):
         self.visited_tiles.add(start_coord)
         
         # Avoid awarding curiosity for simply spawning on a monitored map
-        monitored_maps = {2, 3, 51, 54, 5, 59, 6, 49}
-        if start_map in monitored_maps:
+        if start_map in MONITORED_MAPS_SET:
             self.curiosity_triggered_maps.add(start_map)
+
+        # Snapshot the whole-game event bits already set in the start state, so the LTM
+        # reward vector only reflects new progress made during the episode.
+        self.start_event_bits = self._get_event_bits()
 
         # Initial Party and Event Baseline
         self.last_active_events = self._get_active_events()
@@ -369,6 +502,8 @@ class PokemonRedEnv(gym.Env):
             "events": self.max_events,
             "total_level": total_level,
             "milestones": milestones,
+            "ltm_reward": self._get_ltm_reward(),
+            "ltm_map": self._get_ltm_map(),
             "team_levels": self._get_team_levels(),
             "item_counts": self._get_item_counts(),
             "grid": self._get_grid_vector()
@@ -409,53 +544,70 @@ class PokemonRedEnv(gym.Env):
         coord = self._get_current_position()
         map_id, x, y = coord
         grid = []
-        for dy in range(-4, 5):
-            for dx in range(-4, 5):
+        for dy in range(-GRID_RADIUS, GRID_RADIUS + 1):
+            for dx in range(-GRID_RADIUS, GRID_RADIUS + 1):
                 grid.append(1.0 if (map_id, x + dx, y + dy) in self.visited_tiles else 0.0)
         return np.array(grid, dtype=np.float32)
 
-class RotatingPokemonRedEnv(PokemonRedEnv):
-    def __init__(self, rom_path, state_paths, env_id, **kwargs):
-        if isinstance(state_paths, str):
-            state_paths = [state_paths]
-            
-        self.state_paths = state_paths
-        self.current_state_idx = 0
-        self.env_id = env_id 
-        
-        super().__init__(rom_path, state_path=self.state_paths[0], **kwargs)
+    # ==========================================================
+    # WHOLE-GAME LONG-TERM MEMORY HELPERS
+    # ==========================================================
 
-    def reset(self, seed=None, options=None):
-        self.state_path = self.state_paths[self.current_state_idx]
-        print(f" -> Env {self.env_id} loaded with {len(self.state_paths)} rotating state(s). Current state: {self.state_path}")
-        self.current_state_idx = (self.current_state_idx + 1) % len(self.state_paths)
-        return super().reset(seed=seed, options=options)
+    def _get_event_bits(self):
+        """Raw 2320-length 0/1 vector of the whole-game event-flag RAM region."""
+        block = np.frombuffer(
+            bytes(self.pyboy.memory[RAM_EVENTS_REGION_START:RAM_EVENTS_REGION_END]),
+            dtype=np.uint8,
+        )
+        return np.unpackbits(block, bitorder="little").astype(np.float32)
+
+    def _get_new_event_bits(self):
+        """Event bits with the start-state flags masked out (only new in-episode progress)."""
+        return self._get_event_bits() * (1.0 - self.start_event_bits)
+
+    def _get_ltm_reward(self):
+        """Whole-game long-term reward memory: new event bits + pokeball flag (LTM_REWARD_DIM)."""
+        vec = np.empty(LTM_REWARD_DIM, dtype=np.float32)
+        vec[:NUM_EVENT_BITS] = self._get_new_event_bits()
+        vec[NUM_EVENT_BITS] = 1.0 if self.has_obtained_pokeball else 0.0
+        return vec
+
+    def _get_ltm_map(self):
+        """Whole-game long-term map memory: 1.0 once a monitored map is visited this episode."""
+        return np.array(
+            [1.0 if m in self.visited_maps else 0.0 for m in MONITORED_MAPS],
+            dtype=np.float32,
+        )
+
+# The one and only start state allowed. Every environment loads from this file.
+START_STATE = "PokemonRed.Start.state"
 
 
 def create_envs(num_envs, rom_path, state_dir="StartingFiles", wind="null"):
-    start_state = "PokemonRed.Start.state"
-    other_states = ["PokemonRed.PowerStart.state"]
-    
+    """Create `num_envs` environments, all loading exclusively from PokemonRed.Start.state.
+
+    This project intentionally supports a single start state. No other .state files
+    exist or are accepted.
+    """
+    state_path = os.path.join(state_dir, START_STATE)
+    if not os.path.exists(state_path):
+        raise FileNotFoundError(
+            f"Required start state not found: {state_path}. "
+            f"Only '{START_STATE}' is supported."
+        )
+
     envs = []
-    print(f"Initializing {num_envs} PyBoy Environments...")
-    
+    print(f"Initializing {num_envs} PyBoy Environments (all using {START_STATE})...")
+
     for i in range(num_envs):
-        if i < 3:
-            paths = [os.path.join(state_dir, start_state)]
-        else:
-            start_idx = (i - 3) % len(other_states)
-            rotated_states = other_states[start_idx:] + other_states[:start_idx]
-            paths = [os.path.join(state_dir, s) for s in rotated_states]
-        
-        env = RotatingPokemonRedEnv(
-            rom_path=rom_path, 
-            state_paths=paths, 
-            env_id=i+1,        
-            verbose=True, 
-            window=wind, 
-            speed=0, 
-            advanced=True 
+        env = PokemonRedEnv(
+            rom_path=rom_path,
+            state_path=state_path,
+            verbose=True,
+            window=wind,
+            speed=0,
+            advanced=False,
         )
         envs.append(env)
-        
+
     return envs
