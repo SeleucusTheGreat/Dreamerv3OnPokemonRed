@@ -16,6 +16,15 @@ RAM_EVENTS_REGION_END = 0xD860            # exclusive
 NUM_EVENT_BITS = (RAM_EVENTS_REGION_END - RAM_EVENTS_REGION_START) * 8  # 2320
 LTM_REWARD_DIM = NUM_EVENT_BITS + 1       # +1 pokeball flag = 2321
 
+# --- PROLOGUE REWARD SUPPRESSION ---
+WEVENTFLAGS_START = 0xD747
+EVENT_GOT_POKEDEX = 0x025
+PROLOGUE_LTM_END = (WEVENTFLAGS_START - RAM_EVENTS_REGION_START) * 8 + EVENT_GOT_POKEDEX + 1  # 110
+
+# Noisy event flags to exclude from reward, by LTM index
+# (1032 = 0xD7BF bit 0, the volatile flag previously special-cased during event scanning).
+IGNORED_EVENT_INDICES = (1032,)
+
 # Critical-path maps for the WHOLE game (decimal map IDs, progression order).
 # First entry to any of these (per episode) grants a one-shot curiosity bonus, and the
 # set of visited monitored maps forms the long-term map vector (LTM_MAP_DIM).
@@ -138,45 +147,37 @@ class PokemonRedEnv(gym.Env):
     RAM_MAP_ID = 0xD35E
     RAM_PLAYER_Y = 0xD361
     RAM_PLAYER_X = 0xD362
-    
-    RAM_BATTLE_STATE = 0xD057 
-    
+
     RAM_PARTY_COUNT = 0xD163
     RAM_PARTY_BASE = 0xD16B
     PKMN_DATA_LENGTH = 44
-    
-    RAM_EVENTS_START = 0xD73E
-    RAM_EVENTS_END = 0xD85F
 
     RAM_NUM_BAG_ITEMS = 0xD31D
     RAM_BAG_ITEMS_BASE = 0xD31E
     ITEM_POKEBALL = 0x04
 
-    # Retained original 14-element milestone names for compatibility
-    MILESTONE_NAMES = [
-        "Left House", "Route 1", "Viridian City", "Rival Route 22",
-        "Route 2", "Viridian Forest", "Viridian Trainer", "Pewter City",
-        "Defeated Brock", "Route 3", "Mt. Moon", "Cerulean City",
-        "Defeated Misty", "Obtained Pokeball"
-    ]
-
-    def __init__(self, rom_path, state_path, image_size=64, verbose=False, window="SDL2", speed=0, advanced=False):
+    def __init__(self, rom_path, state_path, image_size=64, verbose=False, window="SDL2", speed=0):
         super().__init__()
-        
+
         self.state_path = state_path
         self.image_size = image_size
         self.verbose = verbose
-        self.advanced = advanced 
         self.has_obtained_pokeball = False
 
         self.visited_maps = set()
 
-        # Start counting events later in memory if using the advanced start
-        self.ram_events_start = 0xD74B if self.advanced else self.RAM_EVENTS_START
-
         # Whole-game long-term event memory: snapshot of the start-state event bits, used
         # to mask out flags that were already set so the LTM vector reflects *new* progress.
         self.start_event_bits = np.zeros(NUM_EVENT_BITS, dtype=np.float32)
+        self.last_event_bits = np.zeros(NUM_EVENT_BITS, dtype=np.float32)
+
+        # Reward-eligibility mask: zero out the prologue region (idx 0..109, up to GOT_POKEDEX)
+        # and any explicitly ignored noisy flags, so neither the event reward nor the LTM
+        # reward vector ever pays for prologue/noise flags.
+        self.reward_keep_mask = np.ones(NUM_EVENT_BITS, dtype=np.float32)
+        self.reward_keep_mask[:PROLOGUE_LTM_END] = 0.0
+        for idx in IGNORED_EVENT_INDICES:
+            self.reward_keep_mask[idx] = 0.0
 
         # Initialize Emulator
         self.pyboy = PyBoy(
@@ -221,7 +222,6 @@ class PokemonRedEnv(gym.Env):
         self.max_step_limit = self.init_steps
         
         self.max_events = 0
-        self.last_active_events = set()
         self.max_level_reward = 0
         self.last_hp_fraction_sum = 0
         self.last_party_count = 0
@@ -275,19 +275,6 @@ class PokemonRedEnv(gym.Env):
         x = self.pyboy.memory[self.RAM_PLAYER_X]
         y = self.pyboy.memory[self.RAM_PLAYER_Y]
         return (map_id, x, y)
-
-    def _get_active_events(self):
-        active_events = set()
-        block = self.pyboy.memory[self.ram_events_start:self.RAM_EVENTS_END]  # one bulk read
-        for offset, val in enumerate(block):
-            if val:
-                addr = self.ram_events_start + offset
-                for i in range(8):
-                    if val & (1 << i):
-                        if addr == 0xD7BF and i == 0:
-                            continue
-                        active_events.add((addr, i))
-        return active_events
 
     def _get_party_info(self):
         party_count = min(max(self.pyboy.memory[self.RAM_PARTY_COUNT], 0), 6)
@@ -362,26 +349,29 @@ class PokemonRedEnv(gym.Env):
         else:
             curiosity = 0.0 + curiosity_bonus
 
-        # EVENT REWARD 
-        current_active_events = self._get_active_events()
-        current_events = len(current_active_events)
-        
+        # EVENT REWARD: +reward_event_val per newly-set, reward-eligible (post-prologue) flag.
+        current_event_bits = self._get_new_event_bits()
+        current_events = int(current_event_bits.sum())
+
         if current_events > self.max_events:
             new_events = current_events - self.max_events
             event_reward_gain = new_events * self.reward_event_val
-            
-            new_bits = current_active_events - self.last_active_events
-            for addr, bit in new_bits:
-                print(f"[EVENT REWARD] Triggered by Memory Address: {hex(addr)}, Bit: {bit}")
-            
+
+            newly_on = np.where((current_event_bits > 0.5) & (self.last_event_bits < 0.5))[0]
+            for idx in newly_on:
+                idx = int(idx)
+                addr = RAM_EVENTS_REGION_START + idx // 8
+                bit = idx % 8
+                print(f"[EVENT REWARD] Triggered by Memory Address: {hex(addr)}, Bit: {bit} (LTM idx {idx})")
+
             self.max_step_limit += (new_events * self.step_increase)
             self.max_events = current_events
             step_reward += event_reward_gain
-            
+
             if self.verbose:
                 print(f"[EVENT] +{event_reward_gain:.3f} | Budget: {self.max_step_limit}")
 
-        self.last_active_events = current_active_events
+        self.last_event_bits = current_event_bits
 
         # Check for Brock defeat milestone reward
         brock_after = (self.pyboy.memory[0xD356] & 1) == 1
@@ -442,7 +432,6 @@ class PokemonRedEnv(gym.Env):
             "limit": self.max_step_limit,
             "events": current_events,
             "total_level": total_level,
-            "milestones": self._get_milestones(),
             "ltm_reward": self._get_ltm_reward(),
             "ltm_map": self._get_ltm_map(),
             "team_levels": self._get_team_levels(),
@@ -483,25 +472,22 @@ class PokemonRedEnv(gym.Env):
         # Snapshot the whole-game event bits already set in the start state, so the LTM
         # reward vector only reflects new progress made during the episode.
         self.start_event_bits = self._get_event_bits()
+        self.last_event_bits = self._get_new_event_bits()  # all zeros after masking
 
-        # Initial Party and Event Baseline
-        self.last_active_events = self._get_active_events()
-        self.max_events = len(self.last_active_events)
+        # Initial Party and Event Baseline (max_events is now 0: prologue + start flags masked).
+        self.max_events = int(self.last_event_bits.sum())
         total_level, hp_fraction_sum, party_count = self._get_party_info()
         self.last_hp_fraction_sum = hp_fraction_sum
         self.last_party_count = party_count
         self.max_level_reward = self._calculate_level_reward(total_level)
         self.has_obtained_pokeball = self._has_pokeball()
         self.brock_defeated = (self.pyboy.memory[0xD356] & 1) == 1
-        
-        milestones = self._get_milestones()
-        
+
         info = {
             "coord": start_coord,
             "curiosity": 0.01,  # First tile is starting tile
             "events": self.max_events,
             "total_level": total_level,
-            "milestones": milestones,
             "ltm_reward": self._get_ltm_reward(),
             "ltm_map": self._get_ltm_map(),
             "team_levels": self._get_team_levels(),
@@ -513,33 +499,6 @@ class PokemonRedEnv(gym.Env):
     def close(self):
         self.pyboy.stop()
     
-    def _get_milestones(self):
-        """Returns a 14-dim vector of macro-level geographic and event milestones."""
-        mem = self.pyboy.memory
-        
-        # MACRO GEOGRAPHY (Map IDs)
-        left_house      = 1.0 if 0 in self.visited_maps else 0.0
-        route_1         = 1.0 if 1 in self.visited_maps else 0.0
-        viridian        = 1.0 if 2 in self.visited_maps else 0.0
-        route_2         = 1.0 if 3 in self.visited_maps else 0.0
-        viridian_forest = 1.0 if 51 in self.visited_maps else 0.0
-        enter_brock_gym = 1.0 if 54 in self.visited_maps else 0.0  
-        route_3         = 1.0 if 5 in self.visited_maps else 0.0
-        mt_moon         = 1.0 if 59 in self.visited_maps else 0.0
-        cerulean        = 1.0 if 6 in self.visited_maps else 0.0
-        rival_route_22   = 1.0 if (mem[0xD74A] & 0b00000001) else 0.0
-        viridian_trainer = 1.0 if (mem[0xD751] & 0b00000010) else 0.0
-        brock    = 1.0 if (mem[0xD356] >> 0) & 1 else 0.0
-        exit_forest = 1.0 if 49 in self.visited_maps else 0.0      
-        pokeball = 1.0 if self.has_obtained_pokeball else 0.0
-        
-        return [
-            left_house, route_1, viridian, rival_route_22,
-            route_2, viridian_forest, viridian_trainer, enter_brock_gym,
-            brock, route_3, mt_moon, cerulean,
-            exit_forest, pokeball
-        ]
-
     def _get_grid_vector(self):
         coord = self._get_current_position()
         map_id, x, y = coord
@@ -562,8 +521,9 @@ class PokemonRedEnv(gym.Env):
         return np.unpackbits(block, bitorder="little").astype(np.float32)
 
     def _get_new_event_bits(self):
-        """Event bits with the start-state flags masked out (only new in-episode progress)."""
-        return self._get_event_bits() * (1.0 - self.start_event_bits)
+        """Reward-eligible event bits: start-state flags and the prologue/ignored region
+        masked out, so only genuinely new post-prologue progress is counted."""
+        return self._get_event_bits() * (1.0 - self.start_event_bits) * self.reward_keep_mask
 
     def _get_ltm_reward(self):
         """Whole-game long-term reward memory: new event bits + pokeball flag (LTM_REWARD_DIM)."""
@@ -606,7 +566,6 @@ def create_envs(num_envs, rom_path, state_dir="StartingFiles", wind="null"):
             verbose=True,
             window=wind,
             speed=0,
-            advanced=False,
         )
         envs.append(env)
 

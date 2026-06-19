@@ -84,7 +84,7 @@ class Policy(nn.Module):
         if not buffer_has_transitions:
             print("\n" + "="*50)
             print("[*] Replay buffer is empty. Gathering initial data from environment...")
-            initial_score = self.dreamer.Play_the_game(number_of_episodes_per_env=1) 
+            initial_score = self.dreamer.Play_the_game(number_of_episodes_per_env=2) 
             print(f"[*] Initial Collection Score: {initial_score}")
             print("="*50 + "\n")
         else:
