@@ -7,12 +7,10 @@ from pyboy import PyBoy
 from pyboy.utils import WindowEvent
 
 # ==========================================================
-# LONG-TERM MEMORY / MAP / GRID DIMENSIONS (whole-game scope)
+# LONG-TERM MEMORY / MAP DIMENSIONS (whole-game scope)
 # ==========================================================
-# Event-flag RAM region: bytes [0xD73E, 0xD860) = 290 bytes = 2320 bits.
-# This is the *whole-game* event memory (every story/script flag).
 RAM_EVENTS_REGION_START = 0xD73E
-RAM_EVENTS_REGION_END = 0xD860            # exclusive
+RAM_EVENTS_REGION_END = 0xD860           
 NUM_EVENT_BITS = (RAM_EVENTS_REGION_END - RAM_EVENTS_REGION_START) * 8  # 2320
 LTM_REWARD_DIM = NUM_EVENT_BITS + 1       # +1 pokeball flag = 2321
 
@@ -22,12 +20,9 @@ EVENT_GOT_POKEDEX = 0x025
 PROLOGUE_LTM_END = (WEVENTFLAGS_START - RAM_EVENTS_REGION_START) * 8 + EVENT_GOT_POKEDEX + 1  # 110
 
 # Noisy event flags to exclude from reward, by LTM index
-# (1032 = 0xD7BF bit 0, the volatile flag previously special-cased during event scanning).
 IGNORED_EVENT_INDICES = (1032,)
 
-# Critical-path maps for the WHOLE game (decimal map IDs, progression order).
-# First entry to any of these (per episode) grants a one-shot curiosity bonus, and the
-# set of visited monitored maps forms the long-term map vector (LTM_MAP_DIM).
+# Maps to track for the curiosity bonus
 MONITORED_MAPS = [
     # --- Pallet -> Pewter (Brock) ---
     12,    # ROUTE_1
@@ -132,13 +127,10 @@ MONITORED_MAPS = [
 LTM_MAP_DIM = len(MONITORED_MAPS)
 MONITORED_MAPS_SET = set(MONITORED_MAPS)
 
-# Egocentric visited-tiles grid (kept from the working project).
-GRID_RADIUS = 4
-GRID_DIM = (2 * GRID_RADIUS + 1) ** 2     # 81
-
-# Per-map curiosity bonus granted on first entry to a monitored map (matches the
-# value the world model decodes as the analytic map-visit signal, if needed).
-MAP_CURIOSITY_BONUS = 1.0
+# Map-transition curiosity: the ONLY exploration/curiosity signal. Granted once per
+# episode the first time the agent enters each monitored map. There is no per-tile
+# or coverage curiosity anymore.
+MAP_CURIOSITY_BONUS = 5.0
 
 
 class PokemonRedEnv(gym.Env):
@@ -332,22 +324,16 @@ class PokemonRedEnv(gym.Env):
         coord = self._get_current_position()
         map_id, x, y = coord
         
-        # --- Map-transition curiosity bonus (+1.0 once per episode), WHOLE-GAME scope ---
-        curiosity_bonus = 0.0
+        # --- Map-transition curiosity (the ONLY curiosity signal): +MAP_CURIOSITY_BONUS
+        # the first time each monitored map is entered this episode, 0 otherwise. ---
+        curiosity = 0.0
         if map_id in MONITORED_MAPS_SET and map_id not in self.curiosity_triggered_maps:
-            curiosity_bonus = MAP_CURIOSITY_BONUS
+            curiosity = MAP_CURIOSITY_BONUS
             self.curiosity_triggered_maps.add(map_id)
             if self.verbose:
                 print(f"[CURIOSITY BONUS] +{MAP_CURIOSITY_BONUS} awarded for transitioning to Map ID: {map_id}")
 
         self.visited_maps.add(map_id)
-
-        # Coordinate-discovery curiosity (0.01 for new visited tile/coordinate) + map transition bonus
-        if coord not in self.visited_tiles:
-            self.visited_tiles.add(coord)
-            curiosity = 0.01 + curiosity_bonus
-        else:
-            curiosity = 0.0 + curiosity_bonus
 
         # EVENT REWARD: +reward_event_val per newly-set, reward-eligible (post-prologue) flag.
         current_event_bits = self._get_new_event_bits()
@@ -436,7 +422,6 @@ class PokemonRedEnv(gym.Env):
             "ltm_map": self._get_ltm_map(),
             "team_levels": self._get_team_levels(),
             "item_counts": self._get_item_counts(),
-            "grid": self._get_grid_vector()
         }
 
         return obs, step_reward, terminated, False, info
@@ -451,19 +436,17 @@ class PokemonRedEnv(gym.Env):
         self.max_step_limit = self.init_steps
         self.episode_level_ups = 0  # Reset the decay counter cleanly
         
-        # Reset tracking coordinates cleanly
+        # Reset tracking sets cleanly
         self.visited_maps = set()
-        self.visited_tiles = set()
-        
-        # --- NEW: Track map curiosity triggers for the current episode ---
+
+        # --- Track map curiosity triggers for the current episode ---
         self.curiosity_triggered_maps = set()
     
         self.pyboy.tick()
         
         start_coord = self._get_current_position()
         start_map = start_coord[0]
-        self.visited_maps.add(start_map) 
-        self.visited_tiles.add(start_coord)
+        self.visited_maps.add(start_map)
         
         # Avoid awarding curiosity for simply spawning on a monitored map
         if start_map in MONITORED_MAPS_SET:
@@ -485,28 +468,18 @@ class PokemonRedEnv(gym.Env):
 
         info = {
             "coord": start_coord,
-            "curiosity": 0.01,  # First tile is starting tile
+            "curiosity": 0.0,  # No curiosity on spawn; only awarded on new-map entry
             "events": self.max_events,
             "total_level": total_level,
             "ltm_reward": self._get_ltm_reward(),
             "ltm_map": self._get_ltm_map(),
             "team_levels": self._get_team_levels(),
             "item_counts": self._get_item_counts(),
-            "grid": self._get_grid_vector()
         }
         return self._get_obs(), info
 
     def close(self):
         self.pyboy.stop()
-    
-    def _get_grid_vector(self):
-        coord = self._get_current_position()
-        map_id, x, y = coord
-        grid = []
-        for dy in range(-GRID_RADIUS, GRID_RADIUS + 1):
-            for dx in range(-GRID_RADIUS, GRID_RADIUS + 1):
-                grid.append(1.0 if (map_id, x + dx, y + dy) in self.visited_tiles else 0.0)
-        return np.array(grid, dtype=np.float32)
 
     # ==========================================================
     # WHOLE-GAME LONG-TERM MEMORY HELPERS

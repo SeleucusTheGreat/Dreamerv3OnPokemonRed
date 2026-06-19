@@ -16,10 +16,10 @@ class Policy(nn.Module):
         self.envs = envs
         self.action_dim = envs[0].action_space.n 
         self.buffer_size = 1000000
-        self.mlp_dim = 1024       # MLP width for all dense models (configurable)
-        self.recurrent_dim = 4096
-        self.rows = 40
-        self.cols = 40
+        self.mlp_dim = 756       # MLP width for all dense models (configurable)
+        self.recurrent_dim = 2048
+        self.rows = 32
+        self.cols = 32
         self.latent_dim = self.rows * self.cols
         self.total_num_episodes = 10000
         self.training_per_episodes = 300
@@ -58,7 +58,7 @@ class Policy(nn.Module):
         
         headers =[
             "envSteps", "gradientSteps", "totalReward",
-            "worldModelLoss", "reconstructionLoss", "rewardPredictorLoss", "klLoss", "teamItemLoss", "ltmRewardLoss", "ltmMapLoss", "gridLoss", "curiosityLoss",
+            "worldModelLoss", "reconstructionLoss", "rewardPredictorLoss", "klLoss", "teamItemLoss", "ltmRewardLoss", "ltmMapLoss", "curiosityLoss",
             "actorLoss", "entropies", "criticLoss", "curiosityCriticLoss", "advantages", "curiosityAdvantages", "criticValues", "curiosityCriticValues"
         ]
         
@@ -190,7 +190,6 @@ class Policy(nn.Module):
                 wm_metrics.get('teamitem_loss', 0),               # teamItemLoss
                 wm_metrics.get('ltm_reward_loss', 0),             # ltmRewardLoss (whole-game LTM)
                 wm_metrics.get('ltm_map_loss', 0),                # ltmMapLoss (whole-game map vector)
-                wm_metrics.get('grid_loss', 0),                   # gridLoss
                 wm_metrics.get('curiosity_loss', 0),              # curiosityLoss
                 dream_metrics.get('actor_loss', 0),               # actorLoss
                 dream_metrics.get('entropies', 0),                # entropies
@@ -235,7 +234,6 @@ class Policy(nn.Module):
         ltm_maps = []
         team_levels = []
         item_counts = []
-        grids = []
         for env in self.envs:
             obs, info = env.reset()
             observations.append(obs)
@@ -243,7 +241,6 @@ class Policy(nn.Module):
             ltm_maps.append(np.array(info["ltm_map"], dtype=np.float32))
             team_levels.append(np.array(info["team_levels"], dtype=np.float32))
             item_counts.append(np.array(info["item_counts"], dtype=np.float32))
-            grids.append(np.array(info["grid"], dtype=np.float32))
 
         while min(episodes_completed) < num_episodes:
             obs_tensor = (torch.from_numpy(np.array(observations)).float() / 255.0).to(self.device)
@@ -251,12 +248,11 @@ class Policy(nn.Module):
             ltm_map_tensor = torch.from_numpy(np.array(ltm_maps)).float().to(self.device)
             team_tensor = torch.from_numpy(np.array(team_levels)).float().to(self.device)
             item_tensor = torch.from_numpy(np.array(item_counts)).float().to(self.device)
-            grid_tensor = torch.from_numpy(np.array(grids)).float().to(self.device)
 
             with torch.no_grad():
-                enc_img, enc_teamitem, enc_ltm_reward, enc_ltm_map, enc_grid = self.dreamer._encode_components(
-                    obs_tensor, ltm_reward_tensor, ltm_map_tensor, team_tensor, item_tensor, grid_tensor)
-                encoded_obs = torch.cat([enc_img, enc_teamitem, enc_ltm_reward, enc_ltm_map, enc_grid], dim=-1)
+                enc_img, enc_teamitem, enc_ltm_reward, enc_ltm_map = self.dreamer._encode_components(
+                    obs_tensor, ltm_reward_tensor, ltm_map_tensor, team_tensor, item_tensor)
+                encoded_obs = torch.cat([enc_img, enc_teamitem, enc_ltm_reward, enc_ltm_map], dim=-1)
 
                 recurrent_state = self.dreamer.recurrentModel(recurrent_state, latent_state, action_onehot)
                 latent_state, _ = self.dreamer.posteriorNet(torch.cat((recurrent_state, encoded_obs), -1))
@@ -275,7 +271,6 @@ class Policy(nn.Module):
                     ltm_maps[i] = np.array(info["ltm_map"], dtype=np.float32)
                     team_levels[i] = np.array(info["team_levels"], dtype=np.float32)
                     item_counts[i] = np.array(info["item_counts"], dtype=np.float32)
-                    grids[i] = np.array(info["grid"], dtype=np.float32)
                     current_rewards[i] += reward
                     steps[i] += 1
                     
@@ -293,7 +288,6 @@ class Policy(nn.Module):
                             ltm_maps[i] = np.array(info["ltm_map"], dtype=np.float32)
                             team_levels[i] = np.array(info["team_levels"], dtype=np.float32)
                             item_counts[i] = np.array(info["item_counts"], dtype=np.float32)
-                            grids[i] = np.array(info["grid"], dtype=np.float32)
                             current_rewards[i] = 0.0
                             steps[i] = 0
                             recurrent_state[i] = torch.zeros(self.recurrent_dim, device=self.device)
