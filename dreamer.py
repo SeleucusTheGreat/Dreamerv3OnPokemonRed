@@ -375,14 +375,8 @@ class Buffer(object):
         self.item_counts = torch.empty((capacity, item_dim), dtype=torch.float32, device='cpu')
         self.team_levels = torch.empty((capacity, team_level_dim), dtype=torch.float32, device='cpu')
         self.actions = torch.empty((capacity, actionSize), dtype=torch.float32, device='cpu')
-        # Reward is stored as two streams (summed only when an env total is needed):
-        #   sparse_rewards   -> memory-tied events (LTM-gated in the dream)
-        #   standard_rewards -> non-memory events (healing, level-ups)
         self.sparse_rewards = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
         self.standard_rewards = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
-        # Curiosity is stored as two streams (summed only when a total is needed):
-        #   sparse_curiosities -> map-transition bonus (map-gated in the dream)
-        #   tile_curiosities   -> per-tile discovery bonus (+0.01), added ungated
         self.sparse_curiosities = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
         self.tile_curiosities = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
 
@@ -410,7 +404,7 @@ class Buffer(object):
         if N < sequenceSize:
             return None
 
-        num_recent = int(round(batchSize * 0.25))
+        num_recent = int(round(batchSize * 0.20))
         num_all = batchSize - num_recent
         sample_indices = []
 
@@ -546,8 +540,19 @@ class Dreamer:
         self.ltm_map_pos_weight = torch.tensor(5.0, device=self.device)
         self.ltm_sparsity_weight = 0.5
 
-        # Exploration: fraction of dream starts resampled from high-novelty states.
+        # Exploration: fraction of dream starts resampled from high-priority states.
         self.dream_priority_fraction = 0.10
+        # Dream-start priority now blends curiosity with sparse reward magnitude, so
+        # imagination is also seeded from states that preceded a big memory-tied reward
+        # (e.g. the +50 Pokeball / event). Curiosity values are O(0.01-few); a sparse
+        # reward is O(50). This weight scales the reward stream before the two are summed
+        # into the sampling distribution: keep at 1.0 to let a present +50 dominate the
+        # prioritized picks (best for surfacing it), or lower it (e.g. ~0.05) to put the
+        # +50 on roughly the same footing as curiosity for a more even blend.
+        self.dream_reward_priority_weight = 1.0
+
+        # Dream sparse-reward curiosity gating
+        self.ltm_gate_threshold = 0.3
 
         # --- Encodings ---
         self.two_hot = TwoHotEncoding(device=self.device)
@@ -564,16 +569,8 @@ class Dreamer:
         self.ltm_map_encoder = LongTermMapEncoder(LTM_MAP_DIM, self.ltm_map_out, hidden=self.mlp_dim).to(self.device)
 
         # --- Predictors (latent -> observation components) ---
-        # Reward prediction is split into two predictors for one conceptual reward:
-        #   sparseRewardPredictor   -> memory-tied events (LTM-gated in the dream)
-        #   standardRewardPredictor -> non-memory events (healing, level-ups)
-        # Their decoded outputs are summed; the sum feeds the single (shared) reward
-        # critic and dynamic normalizer exactly as the original single predictor did.
         self.sparseRewardPredictor = EnsembleRewardPredictor(self.concatenated_dim, num_heads=3, mlp_dim=self.mlp_dim).to(self.device)
         self.standardRewardPredictor = EnsembleRewardPredictor(self.concatenated_dim, num_heads=3, mlp_dim=self.mlp_dim).to(self.device)
-        # Curiosity is one conceptual signal predicted as two streams (summed in the dream):
-        #   curiosityPredictor     -> sparse map-transition curiosity (existing, map-gated)
-        #   tileCuriosityPredictor -> per-tile discovery curiosity (+0.01), added ungated
         self.curiosityPredictor = CuriosityPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
         self.tileCuriosityPredictor = CuriosityPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
         self.teamitemPredictor = TeamItemPredictor(self.concatenated_dim, self.team_dim + self.item_dim, hidden=self.mlp_dim).to(self.device)
@@ -817,9 +814,18 @@ class Dreamer:
             + list(self.tileCuriosityPredictor.parameters()), 10, norm_type=2)
         self.curiosityHeadOptimizer.step()
 
-        # Dream-start priorities: total (sparse + tile) curiosity values.
-        dream_priorities = (batch_data["sparse_curiosities"][:, :-1]
-                            + batch_data["tile_curiosities"][:, :-1]).reshape(-1).detach()
+        # Dream-start priorities: total (map + tile) curiosity PLUS weighted sparse
+        # reward magnitude. Over-sampling high-sparse-reward states as imagination
+        # starts gives the rollout a chance to actually visit the latents behind a
+        # big memory-tied reward (e.g. the +50 Pokeball/event) instead of relying on
+        # the policy to wander there on its own. Sparse rewards are clamped to >= 0 so
+        # only positive events raise priority. (Same [:, :-1] indexing as the curiosity
+        # streams and the reward target, so it stays aligned with full_states.)
+        curiosity_priority = (batch_data["sparse_curiosities"][:, :-1]
+                              + batch_data["tile_curiosities"][:, :-1])
+        reward_priority = batch_data["sparse_rewards"][:, :-1].clamp(min=0.0)
+        dream_priorities = (curiosity_priority
+                            + self.dream_reward_priority_weight * reward_priority).reshape(-1).detach()
 
         metrics = {
             "world_model_loss": world_model_loss.item(),
@@ -848,6 +854,19 @@ class Dreamer:
         prev = torch.tril(torch.ones(T, T, dtype=torch.bool, device=types.device), diagonal=-1)
         seen_before = (eq & prev.unsqueeze(0)).any(dim=2)        # [N, T]
         return (~seen_before).float()
+
+    @staticmethod
+    def _newly_activated_mask(logits, threshold=0.5):
+        """Per-bit memory-novelty gate.
+
+        Given per-step multi-label LTM logits [N, T, D], return a float mask [N, T]
+        that is 1.0 at the first imagined step where ANY bit turns ON
+        (sigmoid > threshold) having been OFF at every earlier step in that row,
+        and 0.0 otherwise."""
+        on = (torch.sigmoid(logits) > threshold)                       # [N, T, D] bool
+        prev_on = torch.cumsum(on.float(), dim=1) - on.float()         # # of ON steps before t
+        newly_on = on & (prev_on < 0.5)                                # on now, never on before
+        return newly_on.any(dim=-1).float()                            # [N, T]
 
     def Dream(self, full_state, batch_data=None, horizon=25, dream_priorities=None):
         self.actorOptimizer.zero_grad(set_to_none=True)
@@ -905,12 +924,13 @@ class Dreamer:
             sparse_curiosity = self.two_hot.decode(self.curiosityPredictor(imagined_steps)).squeeze(-1)
             tile_curiosity = self.two_hot.decode(self.tileCuriosityPredictor(imagined_steps)).squeeze(-1)
 
-            # --- Anti-duplication gate ---
-            reward_type = self.ltm_reward_predictor(imagined_steps).argmax(dim=-1)  # [N, T]
-            map_type = self.ltm_map_predictor(imagined_steps).argmax(dim=-1)        # [N, T]
-            predicted_sparse = predicted_sparse * self._first_occurrence_mask(reward_type)
+            # --- Anti-duplication gate (per-bit memory novelty) --
+            reward_ltm_logits = self.ltm_reward_predictor(imagined_steps)  # [N, T, D]
+            map_ltm_logits = self.ltm_map_predictor(imagined_steps)        # [N, T, D]
+            predicted_sparse = predicted_sparse * self._newly_activated_mask(reward_ltm_logits, self.ltm_gate_threshold)
             predicted_rewards = predicted_sparse + predicted_standard
-            sparse_curiosity = sparse_curiosity * self._first_occurrence_mask(map_type)
+            sparse_curiosity = sparse_curiosity * self._newly_activated_mask(
+                map_ltm_logits, self.ltm_gate_threshold)
             predicted_curiosity = sparse_curiosity + tile_curiosity
 
         imagined_states = full_states.detach()

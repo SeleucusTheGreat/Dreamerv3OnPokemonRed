@@ -397,8 +397,8 @@ class PokemonRedEnv(gym.Env):
                 heal_gain = hp_fraction_sum - self.last_hp_fraction_sum
                 heal_reward = self.reward_heal_mult * heal_gain
                 standard_reward += heal_reward
-                if self.verbose:
-                    print(f"[HEAL] +{heal_reward:.3f} | HP recovered: {heal_gain:.2f}")
+                #if self.verbose:
+                #    print(f"[HEAL] +{heal_reward:.3f} | HP recovered: {heal_gain:.2f}")
 
         self.last_hp_fraction_sum = hp_fraction_sum
         self.last_party_count = party_count

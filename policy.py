@@ -29,7 +29,7 @@ class Policy(nn.Module):
         self.number_of_sequences = 64 # Batch size
         self.steps_per_sequence = 64
         self.curiosity_scale = 0.35
-        self.checkpoint_interval = 3 # Save every N episodes
+        self.checkpoint_interval = 1 # Save every N episodes
         
         self.visualize_dreams = visualize_dreams
         self.seedMeDaddy(self.seed)
