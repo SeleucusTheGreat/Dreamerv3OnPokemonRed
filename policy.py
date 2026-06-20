@@ -1,5 +1,7 @@
 import os
 import csv
+import glob
+import time
 import random
 import numpy as np
 import torch
@@ -143,28 +145,14 @@ class Policy(nn.Module):
                 best_adv_str = ", ".join([f"{d[0]:+.2f}" for d in vis_best])
                 rand_adv_str = ", ".join([f"{d[0]:+.2f}" for d in vis_rand])
                 cur_str = ", ".join([f"{d[0]:+.2f}" for d in vis_curiosity])
-                print(f"[*] Visualizing {len(vis_best)} MAX ADVANTAGE Dreams (Cumulative Advs: [{best_adv_str}])")
-                print(f"[*] Visualizing {len(vis_rand)} RANDOM Dreams (Cumulative Advs: [{rand_adv_str}])")
-                print(f"[*] Visualizing {len(vis_curiosity)} MAX CURIOSITY Dreams (Cumulative Curiosity: [{cur_str}])")
-                
-                for rank, dream_data in enumerate(dreams_to_visualize):
-                    metric_val, b_states, b_rewards, b_values, b_actions, b_adv_r, b_adv_c, label = dream_data
+                print(f"[*] Saving {len(vis_best)} MAX ADVANTAGE Dreams (Cumulative Advs: [{best_adv_str}])")
+                print(f"[*] Saving {len(vis_rand)} RANDOM Dreams (Cumulative Advs: [{rand_adv_str}])")
+                print(f"[*] Saving {len(vis_curiosity)} MAX CURIOSITY Dreams (Cumulative Curiosity: [{cur_str}])")
 
-                    # Change the text dynamically based on what sorting metric was passed
-                    if label == "MaxCuriosity":
-                        title_pref = f"{label} Dream (Total Curiosity: {metric_val:+.2f})"
-                    else:
-                        title_pref = f"{label} Dream (Total Adv: {metric_val:+.2f})"
-
-                    self.dreamer.visualize_single_dream(
-                        b_states.to(self.device),
-                        b_rewards,
-                        b_values,
-                        b_actions,
-                        b_adv_r,
-                        b_adv_c,
-                        title_prefix=title_pref
-                    )
+                # --- Save this training phase's dreams to a single file in dreams/ ---
+                # Keep at most 10 dream files; the oldest is replaced first.
+                dream_path = self._save_dreams_to_file(dreams_to_visualize, episode)
+                print(f"[*] Saved {len(dreams_to_visualize)} dreams to {dream_path}")
             # --- Play Game with Updated Policy ---
             print(f"[*] Stepping environment with updated policy...")
             avg_score = self.dreamer.Play_the_game(number_of_episodes_per_env=1)
@@ -214,6 +202,54 @@ class Policy(nn.Module):
                 filename = f"pokemon_model_R{score_int}_G{self.dreamer.total_num_updates}.pt"
                 path = os.path.join("checkpoints", filename)
                 self.dreamer.saveCheckpoints(path)
+
+    def _save_dreams_to_file(self, dreams_to_visualize, episode):
+        """Save all dreams from one training phase into a single PDF inside the
+        `dreams/` folder. Keeps at most 10 files, replacing the oldest first."""
+        from matplotlib.backends.backend_pdf import PdfPages
+
+        dreams_dir = "dreams"
+        os.makedirs(dreams_dir, exist_ok=True)
+
+        # Unique, time-ordered filename so we can rotate by age later.
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = f"dreams_ep{episode + 1:05d}_g{self.dreamer.total_num_updates}_{timestamp}.pdf"
+        file_path = os.path.join(dreams_dir, filename)
+
+        with PdfPages(file_path) as pdf:
+            for dream_data in dreams_to_visualize:
+                metric_val, b_states, b_rewards, b_values, b_actions, b_adv_r, b_adv_c, label = dream_data
+
+                # Change the title dynamically based on the sorting metric.
+                if label == "MaxCuriosity":
+                    title_pref = f"{label} Dream (Total Curiosity: {metric_val:+.2f})"
+                else:
+                    title_pref = f"{label} Dream (Total Adv: {metric_val:+.2f})"
+
+                self.dreamer.visualize_single_dream(
+                    b_states.to(self.device),
+                    b_rewards,
+                    b_values,
+                    b_actions,
+                    b_adv_r,
+                    b_adv_c,
+                    title_prefix=title_pref,
+                    pdf=pdf,
+                )
+
+        # --- Rotation: keep only the 10 most recent dream files ---
+        existing = sorted(
+            glob.glob(os.path.join(dreams_dir, "*.pdf")),
+            key=os.path.getmtime,
+        )
+        while len(existing) > 10:
+            oldest = existing.pop(0)
+            try:
+                os.remove(oldest)
+            except OSError as e:
+                print(f"[!] Warning: could not remove old dream file {oldest}: {e}")
+
+        return file_path
 
     def evaluate(self, num_episodes=1):
         """ Evaluates BOTH agents simultaneously """

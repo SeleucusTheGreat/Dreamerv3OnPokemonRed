@@ -1201,7 +1201,8 @@ class Dreamer:
     # ------------------------------------------------------
     @torch.no_grad()
     def visualize_single_dream(self, best_states, best_rewards, best_values, best_actions,
-                               reward_advantages=None, curiosity_advantages=None, title_prefix="Dream"):
+                               reward_advantages=None, curiosity_advantages=None, title_prefix="Dream",
+                               pdf=None):
         best_states_device = best_states.to(self.device)
 
         # Predicted total curiosity per imagined state (sparse + tile heads).
@@ -1275,5 +1276,10 @@ class Dreamer:
                              fontsize=9, color='#d1f1a5', fontfamily='monospace', transform=ax_info.transAxes)
 
         plt.subplots_adjust(top=0.85, bottom=0.05, hspace=0.15)
-        plt.show()
+        # If a PdfPages handle is provided, save this dream as a page instead of
+        # printing it to the console; otherwise fall back to the old behaviour.
+        if pdf is not None:
+            pdf.savefig(fig, facecolor=fig.get_facecolor())
+        else:
+            plt.show()
         plt.close(fig)
