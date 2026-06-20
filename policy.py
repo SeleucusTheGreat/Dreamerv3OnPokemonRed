@@ -1,7 +1,6 @@
 import os
 import csv
 import glob
-import time
 import random
 import numpy as np
 import torch
@@ -24,11 +23,11 @@ class Policy(nn.Module):
         self.cols = 32
         self.latent_dim = self.rows * self.cols
         self.total_num_episodes = 10000
-        self.training_per_episodes = 300
+        self.training_per_episodes = 400
         self.seed = 1234
         self.number_of_sequences = 64 # Batch size
         self.steps_per_sequence = 64
-        self.curiosity_scale = 0.35
+        self.curiosity_scale = 0.5
         self.checkpoint_interval = 2 # Save every N episodes
         
         self.visualize_dreams = visualize_dreams
@@ -151,7 +150,7 @@ class Policy(nn.Module):
 
                 # --- Save this training phase's dreams to a single file in dreams/ ---
                 # Keep at most 10 dream files; the oldest is replaced first.
-                dream_path = self._save_dreams_to_file(dreams_to_visualize, episode)
+                dream_path = self._save_dreams_to_file(dreams_to_visualize)
                 print(f"[*] Saved {len(dreams_to_visualize)} dreams to {dream_path}")
             # --- Play Game with Updated Policy ---
             print(f"[*] Stepping environment with updated policy...")
@@ -203,7 +202,19 @@ class Policy(nn.Module):
                 path = os.path.join("checkpoints", filename)
                 self.dreamer.saveCheckpoints(path)
 
-    def _save_dreams_to_file(self, dreams_to_visualize, episode):
+                # Rotation: keep only the 15 most recent checkpoints (oldest out first).
+                ckpts = sorted(
+                    glob.glob(os.path.join("checkpoints", "pokemon_model_R*_G*.pt")),
+                    key=os.path.getmtime,
+                )
+                while len(ckpts) > 15:
+                    oldest = ckpts.pop(0)
+                    try:
+                        os.remove(oldest)
+                    except OSError as e:
+                        print(f"[!] Warning: could not remove old checkpoint {oldest}: {e}")
+
+    def _save_dreams_to_file(self, dreams_to_visualize):
         """Save all dreams from one training phase into a single PDF inside the
         `dreams/` folder. Keeps at most 10 files, replacing the oldest first."""
         from matplotlib.backends.backend_pdf import PdfPages
@@ -211,9 +222,8 @@ class Policy(nn.Module):
         dreams_dir = "dreams"
         os.makedirs(dreams_dir, exist_ok=True)
 
-        # Unique, time-ordered filename so we can rotate by age later.
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = f"dreams_ep{episode + 1:05d}_g{self.dreamer.total_num_updates}_{timestamp}.pdf"
+        # Named by gradient-step count, e.g. dream_g5000.pdf.
+        filename = f"dream_g{self.dreamer.total_num_updates}.pdf"
         file_path = os.path.join(dreams_dir, filename)
 
         with PdfPages(file_path) as pdf:

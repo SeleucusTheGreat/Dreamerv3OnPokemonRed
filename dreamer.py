@@ -540,16 +540,8 @@ class Dreamer:
         self.ltm_map_pos_weight = torch.tensor(5.0, device=self.device)
         self.ltm_sparsity_weight = 0.5
 
-        # Exploration: fraction of dream starts resampled from high-priority states.
-        self.dream_priority_fraction = 0.10
-        # Dream-start priority now blends curiosity with sparse reward magnitude, so
-        # imagination is also seeded from states that preceded a big memory-tied reward
-        # (e.g. the +50 Pokeball / event). Curiosity values are O(0.01-few); a sparse
-        # reward is O(50). This weight scales the reward stream before the two are summed
-        # into the sampling distribution: keep at 1.0 to let a present +50 dominate the
-        # prioritized picks (best for surfacing it), or lower it (e.g. ~0.05) to put the
-        # +50 on roughly the same footing as curiosity for a more even blend.
-        self.dream_reward_priority_weight = 1.0
+        # Exploration: fraction of dream starts resampled from high-novelty states.
+        self.dream_priority_fraction = 0.15
 
         # Dream sparse-reward curiosity gating
         self.ltm_gate_threshold = 0.3
@@ -569,8 +561,9 @@ class Dreamer:
         self.ltm_map_encoder = LongTermMapEncoder(LTM_MAP_DIM, self.ltm_map_out, hidden=self.mlp_dim).to(self.device)
 
         # --- Predictors (latent -> observation components) ---
-        self.sparseRewardPredictor = EnsembleRewardPredictor(self.concatenated_dim, num_heads=3, mlp_dim=self.mlp_dim).to(self.device)
-        self.standardRewardPredictor = EnsembleRewardPredictor(self.concatenated_dim, num_heads=3, mlp_dim=self.mlp_dim).to(self.device)
+        # Single-head reward predictors (no ensemble). Curiosity heads are already single.
+        self.sparseRewardPredictor = RewardPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
+        self.standardRewardPredictor = RewardPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
         self.curiosityPredictor = CuriosityPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
         self.tileCuriosityPredictor = CuriosityPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
         self.teamitemPredictor = TeamItemPredictor(self.concatenated_dim, self.team_dim + self.item_dim, hidden=self.mlp_dim).to(self.device)
@@ -733,26 +726,18 @@ class Dreamer:
         scaled_bt_loss = beta_BT * (invariance_loss + alpha * redundancy_loss)
 
         # ----------------------------------------------------
-        # REWARD (two ensembles) + AUXILIARY PREDICTIONS
-        # One conceptual reward, predicted as sparse + standard streams. Each ensemble
-        # is trained on its own target; the losses are summed and added to the world
-        # model loss just like the original single reward loss.
+        # REWARD (single head each) + AUXILIARY PREDICTIONS
         # ----------------------------------------------------
-        def _ensemble_reward_loss(predictor, logits_ensemble, target_scalar):
+        def _reward_loss(logits, target_scalar):
             with torch.no_grad():
                 target_two_hot = self.two_hot.encode(target_scalar.squeeze(-1))
-            loss = 0.0
-            for h in range(predictor.num_heads):
-                loss += -torch.mean(torch.sum(
-                    target_two_hot * torch.log_softmax(logits_ensemble[h], dim=-1), dim=-1)) * 100
-            return loss / predictor.num_heads
+            return -torch.mean(torch.sum(
+                target_two_hot * torch.log_softmax(logits, dim=-1), dim=-1)) * 100
 
-        sparse_logits_ensemble = self.sparseRewardPredictor(full_states)      # [num_heads, B, T-1, num_bins]
-        standard_logits_ensemble = self.standardRewardPredictor(full_states)
-        sparse_reward_loss = _ensemble_reward_loss(
-            self.sparseRewardPredictor, sparse_logits_ensemble, batch_data["sparse_rewards"][:, :-1])
-        standard_reward_loss = _ensemble_reward_loss(
-            self.standardRewardPredictor, standard_logits_ensemble, batch_data["standard_rewards"][:, :-1])
+        sparse_logits = self.sparseRewardPredictor(full_states)      # [B, T-1, num_bins]
+        standard_logits = self.standardRewardPredictor(full_states)
+        sparse_reward_loss = _reward_loss(sparse_logits, batch_data["sparse_rewards"][:, :-1])
+        standard_reward_loss = _reward_loss(standard_logits, batch_data["standard_rewards"][:, :-1])
         reward_loss = sparse_reward_loss + standard_reward_loss
 
         # Combined team+item prediction (single decoder).
@@ -814,18 +799,9 @@ class Dreamer:
             + list(self.tileCuriosityPredictor.parameters()), 10, norm_type=2)
         self.curiosityHeadOptimizer.step()
 
-        # Dream-start priorities: total (map + tile) curiosity PLUS weighted sparse
-        # reward magnitude. Over-sampling high-sparse-reward states as imagination
-        # starts gives the rollout a chance to actually visit the latents behind a
-        # big memory-tied reward (e.g. the +50 Pokeball/event) instead of relying on
-        # the policy to wander there on its own. Sparse rewards are clamped to >= 0 so
-        # only positive events raise priority. (Same [:, :-1] indexing as the curiosity
-        # streams and the reward target, so it stays aligned with full_states.)
-        curiosity_priority = (batch_data["sparse_curiosities"][:, :-1]
-                              + batch_data["tile_curiosities"][:, :-1])
-        reward_priority = batch_data["sparse_rewards"][:, :-1].clamp(min=0.0)
-        dream_priorities = (curiosity_priority
-                            + self.dream_reward_priority_weight * reward_priority).reshape(-1).detach()
+        # Dream-start priorities: total (sparse + tile) curiosity values.
+        dream_priorities = (batch_data["sparse_curiosities"][:, :-1]
+                            + batch_data["tile_curiosities"][:, :-1]).reshape(-1).detach()
 
         metrics = {
             "world_model_loss": world_model_loss.item(),
@@ -907,19 +883,12 @@ class Dreamer:
         entropies = torch.stack(entropies, dim=1)
         actions_stack = torch.stack(actions_stack, dim=1)
 
-        # --- Predicted rewards (ensemble means) and curiosity ---
+        # --- Predicted rewards (single head each) and curiosity ---
         with torch.no_grad():
             imagined_steps = full_states[:, 1:]
 
-            def _ensemble_mean(predictor, logits_ensemble):
-                return torch.stack(
-                    [self.two_hot.decode(logits_ensemble[h]).squeeze(-1)
-                     for h in range(predictor.num_heads)], dim=0).mean(dim=0)
-
-            predicted_sparse = _ensemble_mean(self.sparseRewardPredictor,
-                                              self.sparseRewardPredictor(imagined_steps))
-            predicted_standard = _ensemble_mean(self.standardRewardPredictor,
-                                                self.standardRewardPredictor(imagined_steps))
+            predicted_sparse = self.two_hot.decode(self.sparseRewardPredictor(imagined_steps)).squeeze(-1)
+            predicted_standard = self.two_hot.decode(self.standardRewardPredictor(imagined_steps)).squeeze(-1)
 
             sparse_curiosity = self.two_hot.decode(self.curiosityPredictor(imagined_steps)).squeeze(-1)
             tile_curiosity = self.two_hot.decode(self.tileCuriosityPredictor(imagined_steps)).squeeze(-1)
@@ -1027,10 +996,6 @@ class Dreamer:
         best_idx = torch.argmax(trajectory_advantages).item()
         rand_idx = torch.randint(0, trajectory_advantages.shape[0], (1,)).item()
         # MaxCuriosity is meant to surface dreams that imagine entering a NEW map
-        # (the sparse +5 stream). Selecting on the total curiosity would let the small,
-        # ungated, ever-present tile bonus (+0.01/step) accumulate over the horizon and
-        # outrank a single gated +5 spike, hiding the map-transition dreams. So rank the
-        # MaxCuriosity pick by the gated sparse stream only.
         trajectory_curiosity = sparse_curiosity.sum(dim=1)
         cur_idx = torch.argmax(trajectory_curiosity).item()
 
