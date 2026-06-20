@@ -849,7 +849,7 @@ class Dreamer:
         seen_before = (eq & prev.unsqueeze(0)).any(dim=2)        # [N, T]
         return (~seen_before).float()
 
-    def Dream(self, full_state, batch_data=None, horizon=15, dream_priorities=None):
+    def Dream(self, full_state, batch_data=None, horizon=25, dream_priorities=None):
         self.actorOptimizer.zero_grad(set_to_none=True)
         self.criticOptimizer.zero_grad(set_to_none=True)
         self.curiosityCriticOptimizer.zero_grad(set_to_none=True)
