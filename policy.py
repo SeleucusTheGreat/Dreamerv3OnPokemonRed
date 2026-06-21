@@ -23,11 +23,11 @@ class Policy(nn.Module):
         self.cols = 32
         self.latent_dim = self.rows * self.cols
         self.total_num_episodes = 10000
-        self.training_per_episodes = 400
+        self.training_per_episodes = 300
         self.seed = 1234
         self.number_of_sequences = 64 # Batch size
         self.steps_per_sequence = 64
-        self.curiosity_scale = 0.5
+        self.curiosity_scale = 0.50
         self.checkpoint_interval = 2 # Save every N episodes
         
         self.visualize_dreams = visualize_dreams

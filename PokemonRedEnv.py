@@ -127,15 +127,9 @@ MONITORED_MAPS = [
 LTM_MAP_DIM = len(MONITORED_MAPS)
 MONITORED_MAPS_SET = set(MONITORED_MAPS)
 
-# Map-transition curiosity (the "sparse" curiosity stream): granted once per episode
-# the first time the agent enters each monitored map. Summed with the per-tile
-# discovery curiosity below to form the total curiosity signal.
-MAP_CURIOSITY_BONUS = 5.0
-
-# Per-tile exploration curiosity: +TILE_CURIOSITY_BONUS the first time each
-# (map_id, x, y) tile is entered within an episode. This is summed with the
-# sparse map-transition curiosity above to form the total curiosity signal.
-TILE_CURIOSITY_BONUS = 0.01
+# Map-transition curiosity: granted once per episode the first time the agent
+# enters each monitored map. This is the sole curiosity signal.
+MAP_CURIOSITY_BONUS = 1.0
 
 
 class PokemonRedEnv(gym.Env):
@@ -162,7 +156,6 @@ class PokemonRedEnv(gym.Env):
         self.has_obtained_pokeball = False
 
         self.visited_maps = set()
-        self.visited_tiles = set()
 
         # Whole-game long-term event memory: snapshot of the start-state event bits, used
         # to mask out flags that were already set so the LTM vector reflects *new* progress.
@@ -336,7 +329,7 @@ class PokemonRedEnv(gym.Env):
         coord = self._get_current_position()
         map_id, x, y = coord
         
-        # --- Sparse (map-transition) curiosity: +MAP_CURIOSITY_BONUS the first time
+        # --- Map-transition curiosity: +MAP_CURIOSITY_BONUS the first time
         # each monitored map is entered this episode, 0 otherwise. ---
         sparse_curiosity = 0.0
         if map_id in MONITORED_MAPS_SET and map_id not in self.curiosity_triggered_maps:
@@ -344,13 +337,6 @@ class PokemonRedEnv(gym.Env):
             self.curiosity_triggered_maps.add(map_id)
             if self.verbose:
                 print(f"[CURIOSITY BONUS] +{MAP_CURIOSITY_BONUS} awarded for transitioning to Map ID: {map_id}")
-
-        # --- Tile-discovery curiosity: +TILE_CURIOSITY_BONUS the first time each
-        # (map_id, x, y) tile is visited this episode. Summed with the sparse one. ---
-        tile_curiosity = 0.0
-        if coord not in self.visited_tiles:
-            tile_curiosity = TILE_CURIOSITY_BONUS
-            self.visited_tiles.add(coord)
 
         self.visited_maps.add(map_id)
 
@@ -435,9 +421,8 @@ class PokemonRedEnv(gym.Env):
 
         info = {
             "coord": coord,
-            "curiosity": sparse_curiosity + tile_curiosity,
+            "curiosity": sparse_curiosity,
             "sparse_curiosity": sparse_curiosity,
-            "tile_curiosity": tile_curiosity,
             "sparse_reward": sparse_reward,
             "standard_reward": standard_reward,
             "steps": self.current_step, 
@@ -468,19 +453,15 @@ class PokemonRedEnv(gym.Env):
         # --- Track map curiosity triggers for the current episode ---
         self.curiosity_triggered_maps = set()
 
-        # --- Track per-tile discovery for the current episode ---
-        self.visited_tiles = set()
-
         self.pyboy.tick()
 
         start_coord = self._get_current_position()
         start_map = start_coord[0]
         self.visited_maps.add(start_map)
 
-        # Avoid awarding curiosity for simply spawning on a monitored map / tile
+        # Avoid awarding curiosity for simply spawning on a monitored map
         if start_map in MONITORED_MAPS_SET:
             self.curiosity_triggered_maps.add(start_map)
-        self.visited_tiles.add(start_coord)
 
         # Snapshot the whole-game event bits already set in the start state, so the LTM
         # reward vector only reflects new progress made during the episode.
@@ -498,9 +479,8 @@ class PokemonRedEnv(gym.Env):
 
         info = {
             "coord": start_coord,
-            "curiosity": 0.0,  # No curiosity on spawn; only awarded on new-map/new-tile entry
+            "curiosity": 0.0,  # No curiosity on spawn; only awarded on new-map entry
             "sparse_curiosity": 0.0,
-            "tile_curiosity": 0.0,
             "events": self.max_events,
             "total_level": total_level,
             "ltm_reward": self._get_ltm_reward(),
