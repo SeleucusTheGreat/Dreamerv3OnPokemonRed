@@ -128,7 +128,7 @@ LTM_MAP_DIM = len(MONITORED_MAPS)
 MONITORED_MAPS_SET = set(MONITORED_MAPS)
 
 # Map-transition curiosity: granted once per episode the first time the agent
-# enters each monitored map. This is the sole curiosity signal.
+# enters each monitored map.
 MAP_CURIOSITY_BONUS = 1.0
 
 

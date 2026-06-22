@@ -520,7 +520,7 @@ class Dreamer:
         self.enconder_output_size = (self.image_out + self.teamitem_out
                                      + self.ltm_reward_out + self.ltm_map_out)
 
-        self.entropy_scale = 0.001
+        self.entropy_scale = 0.002
         self.number_of_sequences = number_of_sequences
         self.steps_per_sequence = steps_per_sequence
         self.buffer_capacity = buffer_size
@@ -821,7 +821,7 @@ class Dreamer:
         newly_on = on & (prev_on < 0.5)                                # on now, never on before
         return newly_on.any(dim=-1).float()                            # [N, T]
 
-    def Dream(self, full_state, batch_data=None, horizon=25, dream_priorities=None):
+    def Dream(self, full_state, batch_data=None, horizon=20, dream_priorities=None):
         self.actorOptimizer.zero_grad(set_to_none=True)
         self.criticOptimizer.zero_grad(set_to_none=True)
         self.curiosityCriticOptimizer.zero_grad(set_to_none=True)
@@ -997,7 +997,9 @@ class Dreamer:
         num_envs = len(self.envs)
         episodes_completed = [0] * num_envs
         scores = []
+        curiosity_scores = []
         current_rewards = [0.0] * num_envs
+        current_curiosities = [0.0] * num_envs
         local_buffers = [[] for _ in range(num_envs)]
         maps_visited = [set() for _ in range(num_envs)]
 
@@ -1050,6 +1052,8 @@ class Dreamer:
                     sparse_reward = next_info.get("sparse_reward", 0.0)
                     standard_reward = next_info.get("standard_reward", 0.0)
                     sparse_curiosity = next_info.get("sparse_curiosity", 0.0)
+                    # Total curiosity for this episode (map-transition curiosity).
+                    current_curiosities[i] += sparse_curiosity
 
                     local_buffers[i].append((
                         observations[i].copy(), ltm_rewards[i].copy(), ltm_maps[i].copy(),
@@ -1065,12 +1069,14 @@ class Dreamer:
 
                     if done:
                         print(f"    [Env {i+1}] Episode done | Reward: {current_rewards[i]:.2f} | "
+                              f"Curiosity: {current_curiosities[i]:.3f} | "
                               f"Unique maps visited: {len(maps_visited[i])} {sorted(maps_visited[i])}")
                         maps_visited[i] = set()
                         for transition in local_buffers[i]:
                             self.buffer.add(*transition)
                         local_buffers[i].clear()
                         scores.append(current_rewards[i])
+                        curiosity_scores.append(current_curiosities[i])
                         self.total_num_episodes += 1
                         episodes_completed[i] += 1
 
@@ -1082,6 +1088,7 @@ class Dreamer:
                             team_levels[i] = np.array(next_info["team_levels"], dtype=np.float32)
                             item_counts[i] = np.array(next_info["item_counts"], dtype=np.float32)
                             current_rewards[i] = 0.0
+                            current_curiosities[i] = 0.0
                             recurrent_state[i] = torch.zeros(self.recurrent_dim, device=self.device)
                             latent_state[i] = torch.zeros(self.latent_dim, device=self.device)
                             action[i] = torch.zeros(self.action_dim, device=self.device)
@@ -1091,7 +1098,9 @@ class Dreamer:
                 self.buffer.add(*transition)
             local_buffers[i].clear()
 
-        return round(sum(scores) / len(scores), 2) if scores else 0.0
+        avg_score = round(sum(scores) / len(scores), 2) if scores else 0.0
+        avg_curiosity = round(sum(curiosity_scores) / len(curiosity_scores), 4) if curiosity_scores else 0.0
+        return avg_score, avg_curiosity
 
     # ------------------------------------------------------
     # CHECKPOINTING (clean dict-based save/load with graceful fallback)

@@ -18,7 +18,7 @@ class Policy(nn.Module):
         self.action_dim = envs[0].action_space.n 
         self.buffer_size = 1000000
         self.mlp_dim = 756       # MLP width for all dense models (configurable)
-        self.recurrent_dim = 2048
+        self.recurrent_dim = 4096
         self.rows = 32
         self.cols = 32
         self.latent_dim = self.rows * self.cols
@@ -27,7 +27,7 @@ class Policy(nn.Module):
         self.seed = 1234
         self.number_of_sequences = 64 # Batch size
         self.steps_per_sequence = 64
-        self.curiosity_scale = 0.50
+        self.curiosity_scale = 0.35
         self.checkpoint_interval = 2 # Save every N episodes
         
         self.visualize_dreams = visualize_dreams
@@ -58,7 +58,7 @@ class Policy(nn.Module):
         csv_filename = "pokemon_training_metrics.csv"
         
         headers =[
-            "envSteps", "gradientSteps", "totalReward",
+            "envSteps", "gradientSteps", "totalReward", "totalCuriosity",
             "worldModelLoss", "reconstructionLoss", "rewardPredictorLoss", "klLoss", "teamItemLoss", "ltmRewardLoss", "ltmMapLoss", "curiosityLoss",
             "actorLoss", "entropies", "criticLoss", "curiosityCriticLoss", "advantages", "curiosityAdvantages", "criticValues", "curiosityCriticValues"
         ]
@@ -80,13 +80,29 @@ class Policy(nn.Module):
             except Exception as e:
                 print(f"[!] Warning: Could not recover steps from CSV: {e}")
 
+            # --- Migrate older CSVs that predate the totalCuriosity column ---
+            try:
+                with open(csv_filename, 'r', newline='') as f:
+                    rows = list(csv.reader(f))
+                if rows and 'totalCuriosity' not in rows[0]:
+                    insert_at = headers.index('totalCuriosity')
+                    rows[0].insert(insert_at, 'totalCuriosity')
+                    for r in rows[1:]:
+                        if r:
+                            r.insert(insert_at, '')  # old rows have no curiosity record
+                    with open(csv_filename, 'w', newline='') as f:
+                        csv.writer(f).writerows(rows)
+                    print("[*] Added 'totalCuriosity' column to existing CSV (past rows left blank).")
+            except Exception as e:
+                print(f"[!] Warning: Could not migrate CSV for totalCuriosity: {e}")
+
         # --- Initial Buffer Fill ---
         buffer_has_transitions = self.dreamer.buffer.full or (self.dreamer.buffer.index > 0)
         if not buffer_has_transitions:
             print("\n" + "="*50)
             print("[*] Replay buffer is empty. Gathering initial data from environment...")
-            initial_score = self.dreamer.Play_the_game(number_of_episodes_per_env=2) 
-            print(f"[*] Initial Collection Score: {initial_score}")
+            initial_score, initial_curiosity = self.dreamer.Play_the_game(number_of_episodes_per_env=2)
+            print(f"[*] Initial Collection Score: {initial_score} | Curiosity: {initial_curiosity}")
             print("="*50 + "\n")
         else:
             print("\n" + "="*50)
@@ -154,7 +170,7 @@ class Policy(nn.Module):
                 print(f"[*] Saved {len(dreams_to_visualize)} dreams to {dream_path}")
             # --- Play Game with Updated Policy ---
             print(f"[*] Stepping environment with updated policy...")
-            avg_score = self.dreamer.Play_the_game(number_of_episodes_per_env=1)
+            avg_score, avg_curiosity = self.dreamer.Play_the_game(number_of_episodes_per_env=1)
 
             self.dreamer.buffer.print_diagnostics()
             
@@ -162,6 +178,7 @@ class Policy(nn.Module):
             print(f"    > Total Env Steps : {self.dreamer.total_num_steps}")
             print(f"    > Gradient Steps  : {self.dreamer.total_num_updates}")
             print(f"    > Total Reward    : {avg_score:.2f}")
+            print(f"    > Total Curiosity : {avg_curiosity:.4f}")
             print(f"    > Actor Entropy   : {dream_metrics.get('entropies', 0):.4f}")
             print(f"    > Mean dream curiosity: {dream_metrics.get('dream_mean_curiosity', 0):.4f}")
 
@@ -170,6 +187,7 @@ class Policy(nn.Module):
                 self.dreamer.total_num_steps,                     # envSteps
                 self.dreamer.total_num_updates,                   # gradientSteps
                 avg_score,                                        # totalReward
+                avg_curiosity,                                    # totalCuriosity (map-transition curiosity, summed over episode)
                 wm_metrics.get('world_model_loss', 0),            # worldModelLoss
                 wm_metrics.get('reconstruction_loss', 0),         # reconstructionLoss
                 wm_metrics.get('reward_loss', 0),                 # rewardPredictorLoss
