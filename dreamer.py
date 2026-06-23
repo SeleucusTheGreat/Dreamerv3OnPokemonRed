@@ -378,12 +378,13 @@ class Buffer(object):
         self.sparse_rewards = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
         self.standard_rewards = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
         self.sparse_curiosities = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
+        self.tile_curiosities = torch.empty((capacity, 1), dtype=torch.float32, device='cpu')
 
         self.index = 0
         self.full = False
 
     def add(self, observation, ltm_reward, ltm_map, item_count, team_level, action,
-            sparse_reward, standard_reward, sparse_curiosity):
+            sparse_reward, standard_reward, sparse_curiosity, tile_curiosity):
         self.observations[self.index] = torch.as_tensor(observation, dtype=torch.uint8)
         self.ltm_rewards[self.index] = torch.as_tensor(ltm_reward, dtype=torch.uint8)
         self.ltm_maps[self.index] = torch.as_tensor(ltm_map, dtype=torch.uint8)
@@ -393,6 +394,7 @@ class Buffer(object):
         self.sparse_rewards[self.index] = torch.as_tensor(sparse_reward, dtype=torch.float32)
         self.standard_rewards[self.index] = torch.as_tensor(standard_reward, dtype=torch.float32)
         self.sparse_curiosities[self.index] = torch.as_tensor(sparse_curiosity, dtype=torch.float32)
+        self.tile_curiosities[self.index] = torch.as_tensor(tile_curiosity, dtype=torch.float32)
 
         self.index = (self.index + 1) % self.capacity
         self.full = self.full or (self.index == 0)
@@ -438,6 +440,7 @@ class Buffer(object):
             "sparse_rewards":     self.sparse_rewards[sampleIndex].to(self.device, non_blocking=True),
             "standard_rewards":   self.standard_rewards[sampleIndex].to(self.device, non_blocking=True),
             "sparse_curiosities": self.sparse_curiosities[sampleIndex].to(self.device, non_blocking=True),
+            "tile_curiosities":   self.tile_curiosities[sampleIndex].to(self.device, non_blocking=True),
             "index":        sampleIndex.to(self.device, non_blocking=True),
         }
 
@@ -453,6 +456,7 @@ class Buffer(object):
             'sparse_rewards': self.sparse_rewards[:limit],
             'standard_rewards': self.standard_rewards[:limit],
             'sparse_curiosities': self.sparse_curiosities[:limit],
+            'tile_curiosities': self.tile_curiosities[:limit],
             'index': self.index,
             'full': self.full,
         }, path)
@@ -462,7 +466,7 @@ class Buffer(object):
         n = min(ckpt['observations'].shape[0], self.capacity)
         for name in ('observations', 'ltm_rewards', 'ltm_maps', 'item_counts',
                      'team_levels', 'actions', 'sparse_rewards', 'standard_rewards',
-                     'sparse_curiosities'):
+                     'sparse_curiosities', 'tile_curiosities'):
             if name in ckpt:
                 getattr(self, name)[:n] = ckpt[name][:n]
             elif name == 'sparse_curiosities' and 'curiosities' in ckpt:
@@ -561,6 +565,8 @@ class Dreamer:
         self.sparseRewardPredictor = RewardPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
         self.standardRewardPredictor = RewardPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
         self.curiosityPredictor = CuriosityPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
+        # Second curiosity head: dense intra-map tile curiosity (un-gated in dreams).
+        self.tileCuriosityPredictor = CuriosityPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
         self.teamitemPredictor = TeamItemPredictor(self.concatenated_dim, self.team_dim + self.item_dim, hidden=self.mlp_dim).to(self.device)
         self.ltm_reward_predictor = LongTermMemoryPredictor(self.concatenated_dim, LTM_REWARD_DIM, hidden=self.mlp_dim).to(self.device)
         self.ltm_map_predictor = LongTermMapPredictor(self.concatenated_dim, LTM_MAP_DIM, hidden=self.mlp_dim).to(self.device)
@@ -620,6 +626,10 @@ class Dreamer:
         self.curiosityCriticOptimizer = torch.optim.Adam(self.curiosity_critic.parameters(), lr=1e-4)
         self.curiosityHeadOptimizer = torch.optim.Adam(
             self.curiosityPredictor.parameters(), lr=1e-4)
+        # Separate optimizer for the tile head (kept out of the checkpoint lists,
+        # fresh-init like curiosityPredictor, so existing checkpoints still load).
+        self.tileCuriosityHeadOptimizer = torch.optim.Adam(
+            self.tileCuriosityPredictor.parameters(), lr=1e-4)
 
         # --- Statistics ---
         self.num_episodes = 0
@@ -774,19 +784,27 @@ class Dreamer:
         self.decoderOptimizer.step()
 
         # --- Curiosity head training on real (prior) states ---
-        # Single head: map-transition curiosity.
+        # Two independent heads: map-transition curiosity + intra-map tile curiosity.
         prior_states_flat = full_states_prior.detach().view(-1, self.concatenated_dim)
         with torch.no_grad():
             target_sparse_curiosity = self.two_hot.encode(batch_data["sparse_curiosities"][:, :-1].squeeze(-1).reshape(-1))
+            target_tile_curiosity = self.two_hot.encode(batch_data["tile_curiosities"][:, :-1].squeeze(-1).reshape(-1))
         self.curiosityHeadOptimizer.zero_grad(set_to_none=True)
+        self.tileCuriosityHeadOptimizer.zero_grad(set_to_none=True)
         pred_sparse_curiosity_logits = self.curiosityPredictor(prior_states_flat)
         sparse_curiosity_loss = -torch.mean(torch.sum(
             target_sparse_curiosity * torch.log_softmax(pred_sparse_curiosity_logits, dim=-1), dim=-1))
-        curiosity_loss = sparse_curiosity_loss
+        pred_tile_curiosity_logits = self.tileCuriosityPredictor(prior_states_flat)
+        tile_curiosity_loss = -torch.mean(torch.sum(
+            target_tile_curiosity * torch.log_softmax(pred_tile_curiosity_logits, dim=-1), dim=-1))
+        curiosity_loss = sparse_curiosity_loss + tile_curiosity_loss
         curiosity_loss.backward()
         nn.utils.clip_grad_norm_(
             self.curiosityPredictor.parameters(), 10, norm_type=2)
+        nn.utils.clip_grad_norm_(
+            self.tileCuriosityPredictor.parameters(), 10, norm_type=2)
         self.curiosityHeadOptimizer.step()
+        self.tileCuriosityHeadOptimizer.step()
 
         # Dream-start priorities: map-transition curiosity values.
         dream_priorities = batch_data["sparse_curiosities"][:, :-1].reshape(-1).detach()
@@ -803,6 +821,7 @@ class Dreamer:
             "ltm_map_loss": ltm_map_loss.item(),
             "curiosity_loss": curiosity_loss.item(),
             "sparse_curiosity_loss": sparse_curiosity_loss.item(),
+            "tile_curiosity_loss": tile_curiosity_loss.item(),
             "decoder_loss": decoder_loss.item(),
         }
         return full_states.view(-1, self.concatenated_dim).detach(), dream_priorities, metrics
@@ -879,15 +898,18 @@ class Dreamer:
             predicted_standard = self.two_hot.decode(self.standardRewardPredictor(imagined_steps)).squeeze(-1)
 
             sparse_curiosity = self.two_hot.decode(self.curiosityPredictor(imagined_steps)).squeeze(-1)
+            tile_curiosity = self.two_hot.decode(self.tileCuriosityPredictor(imagined_steps)).squeeze(-1)
 
             # --- Anti-duplication gate (per-bit memory novelty) --
             reward_ltm_logits = self.ltm_reward_predictor(imagined_steps)  # [N, T, D]
             map_ltm_logits = self.ltm_map_predictor(imagined_steps)        # [N, T, D]
             predicted_sparse = predicted_sparse * self._newly_activated_mask(reward_ltm_logits, self.ltm_gate_threshold)
             predicted_rewards = predicted_sparse + predicted_standard
+            # Map-transition curiosity is gated by map-memory novelty; tile curiosity
+            # is intra-map (it never flips a map bit) so it must stay UN-gated.
             curiosity_gate = self._newly_activated_mask(map_ltm_logits, self.ltm_gate_threshold)
             sparse_curiosity = sparse_curiosity * curiosity_gate
-            predicted_curiosity = sparse_curiosity
+            predicted_curiosity = sparse_curiosity + tile_curiosity
 
         imagined_states = full_states.detach()
         online_values = self.two_hot.decode(self.critic(imagined_states)).squeeze(-1)
@@ -1052,14 +1074,15 @@ class Dreamer:
                     sparse_reward = next_info.get("sparse_reward", 0.0)
                     standard_reward = next_info.get("standard_reward", 0.0)
                     sparse_curiosity = next_info.get("sparse_curiosity", 0.0)
-                    # Total curiosity for this episode (map-transition curiosity).
-                    current_curiosities[i] += sparse_curiosity
+                    tile_curiosity = next_info.get("tile_curiosity", 0.0)
+                    # Total curiosity for this episode (map-transition + tile).
+                    current_curiosities[i] += sparse_curiosity + tile_curiosity
 
                     local_buffers[i].append((
                         observations[i].copy(), ltm_rewards[i].copy(), ltm_maps[i].copy(),
                         item_counts[i].copy(), team_levels[i].copy(),
                         actions_for_buffer[i].copy(), sparse_reward, standard_reward,
-                        sparse_curiosity))
+                        sparse_curiosity, tile_curiosity))
 
                     observations[i] = next_observation
                     ltm_rewards[i] = np.array(next_info["ltm_reward"], dtype=np.float32)

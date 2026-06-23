@@ -18,16 +18,16 @@ class Policy(nn.Module):
         self.action_dim = envs[0].action_space.n 
         self.buffer_size = 1000000
         self.mlp_dim = 756       # MLP width for all dense models (configurable)
-        self.recurrent_dim = 4096
+        self.recurrent_dim = 2048
         self.rows = 32
         self.cols = 32
         self.latent_dim = self.rows * self.cols
         self.total_num_episodes = 10000
         self.training_per_episodes = 300
-        self.seed = 1234
+        self.seed = 42
         self.number_of_sequences = 64 # Batch size
         self.steps_per_sequence = 64
-        self.curiosity_scale = 0.35
+        self.curiosity_scale = 0.5
         self.checkpoint_interval = 2 # Save every N episodes
         
         self.visualize_dreams = visualize_dreams
@@ -187,7 +187,7 @@ class Policy(nn.Module):
                 self.dreamer.total_num_steps,                     # envSteps
                 self.dreamer.total_num_updates,                   # gradientSteps
                 avg_score,                                        # totalReward
-                avg_curiosity,                                    # totalCuriosity (map-transition curiosity, summed over episode)
+                avg_curiosity,                                    # totalCuriosity (map-transition + tile curiosity, summed over episode)
                 wm_metrics.get('world_model_loss', 0),            # worldModelLoss
                 wm_metrics.get('reconstruction_loss', 0),         # reconstructionLoss
                 wm_metrics.get('reward_loss', 0),                 # rewardPredictorLoss

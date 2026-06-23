@@ -127,9 +127,57 @@ MONITORED_MAPS = [
 LTM_MAP_DIM = len(MONITORED_MAPS)
 MONITORED_MAPS_SET = set(MONITORED_MAPS)
 
+# Human-readable names for the monitored maps, used in curiosity log messages.
+MAP_NAMES = {
+    12: "Route 1", 1: "Viridian City", 13: "Route 2", 51: "Viridian Forest",
+    2: "Pewter City", 54: "Pewter Gym",
+    14: "Route 3", 59: "Mt. Moon 1F", 60: "Mt. Moon B1F", 61: "Mt. Moon B2F",
+    15: "Route 4", 3: "Cerulean City", 65: "Cerulean Gym",
+    35: "Route 24", 36: "Route 25",
+    16: "Route 5", 17: "Route 6", 5: "Vermilion City",
+    95: "S.S. Anne 1F", 96: "S.S. Anne 2F", 101: "S.S. Anne Captain's Room",
+    92: "Vermilion Gym",
+    20: "Route 9", 21: "Route 10", 82: "Rock Tunnel 1F", 232: "Rock Tunnel B1F",
+    4: "Lavender Town",
+    19: "Route 8", 18: "Route 7", 6: "Celadon City", 134: "Celadon Gym",
+    135: "Game Corner", 199: "Rocket Hideout B1F", 200: "Rocket Hideout B2F",
+    201: "Rocket Hideout B3F", 202: "Rocket Hideout B4F",
+    142: "Pokemon Tower 1F", 143: "Pokemon Tower 2F", 144: "Pokemon Tower 3F",
+    145: "Pokemon Tower 4F", 146: "Pokemon Tower 5F", 147: "Pokemon Tower 6F",
+    148: "Pokemon Tower 7F",
+    10: "Saffron City",
+    181: "Silph Co. 1F", 207: "Silph Co. 2F", 208: "Silph Co. 3F",
+    209: "Silph Co. 4F", 210: "Silph Co. 5F", 211: "Silph Co. 6F",
+    212: "Silph Co. 7F", 213: "Silph Co. 8F", 233: "Silph Co. 9F",
+    234: "Silph Co. 10F", 235: "Silph Co. 11F", 178: "Saffron Gym",
+    23: "Route 12", 24: "Route 13", 25: "Route 14", 26: "Route 15",
+    7: "Fuchsia City", 157: "Fuchsia Gym",
+    220: "Safari Zone Center", 217: "Safari Zone East", 218: "Safari Zone North",
+    219: "Safari Zone West", 222: "Safari Zone Secret House",
+    30: "Route 19", 31: "Route 20", 8: "Cinnabar Island",
+    165: "Pokemon Mansion 1F", 214: "Pokemon Mansion 2F",
+    215: "Pokemon Mansion 3F", 216: "Pokemon Mansion B1F", 166: "Cinnabar Gym",
+    45: "Viridian Gym", 33: "Route 22", 34: "Route 23",
+    108: "Victory Road 1F", 194: "Victory Road 2F", 198: "Victory Road 3F",
+    9: "Indigo Plateau", 174: "Indigo Plateau Lobby",
+    245: "Lorelei's Room", 246: "Bruno's Room", 247: "Agatha's Room",
+    113: "Lance's Room", 120: "Champion's Room", 118: "Hall of Fame",
+}
+
 # Map-transition curiosity: granted once per episode the first time the agent
 # enters each monitored map.
 MAP_CURIOSITY_BONUS = 1.0
+
+# Tile (intra-map) curiosity: a dense, fast-decaying exploration bonus granted
+# the first time each (map, x, y) tile is stepped on this episode. The bonus
+# decays per *new tile already discovered in the same map*, so the first few
+# tiles of a fresh map pay ~TILE_CURIOSITY_BONUS and a well-trodden map is
+# quickly exhausted. Entering a new map resets the decay (its tile counter
+# starts at 0), which is why this rewards moving on rather than pacing.
+#   bonus(tile) = TILE_CURIOSITY_BONUS * TILE_CURIOSITY_DECAY ** (tiles_seen_in_map)
+# Tune TILE_CURIOSITY_DECAY in (0,1): smaller = exhausts the map faster.
+TILE_CURIOSITY_BONUS = 0.01
+TILE_CURIOSITY_DECAY = 0.97
 
 
 class PokemonRedEnv(gym.Env):
@@ -336,7 +384,19 @@ class PokemonRedEnv(gym.Env):
             sparse_curiosity = MAP_CURIOSITY_BONUS
             self.curiosity_triggered_maps.add(map_id)
             if self.verbose:
-                print(f"[CURIOSITY BONUS] +{MAP_CURIOSITY_BONUS} awarded for transitioning to Map ID: {map_id}")
+                map_name = MAP_NAMES.get(map_id, f"Map ID {map_id}")
+                print(f"[CURIOSITY BONUS] +{MAP_CURIOSITY_BONUS} awarded for transitioning to {map_name}")
+
+        # --- Tile curiosity: dense, fast-decaying bonus the first time each
+        # (map, x, y) tile is visited this episode. Kept separate from the
+        # map-transition bonus so the dream can credit it WITHOUT the map-novelty
+        # gate (intra-map tiles never flip a map memory bit). ---
+        tile_curiosity = 0.0
+        if coord not in self.episode_visited_tiles:
+            self.episode_visited_tiles.add(coord)
+            tiles_seen = self.map_tiles_discovered.get(map_id, 0)
+            tile_curiosity = TILE_CURIOSITY_BONUS * (TILE_CURIOSITY_DECAY ** tiles_seen)
+            self.map_tiles_discovered[map_id] = tiles_seen + 1
 
         self.visited_maps.add(map_id)
 
@@ -421,8 +481,9 @@ class PokemonRedEnv(gym.Env):
 
         info = {
             "coord": coord,
-            "curiosity": sparse_curiosity,
-            "sparse_curiosity": sparse_curiosity,
+            "curiosity": sparse_curiosity + tile_curiosity,  # combined, for logging
+            "sparse_curiosity": sparse_curiosity,             # map-transition only
+            "tile_curiosity": tile_curiosity,                 # intra-map exploration
             "sparse_reward": sparse_reward,
             "standard_reward": standard_reward,
             "steps": self.current_step, 
@@ -453,6 +514,10 @@ class PokemonRedEnv(gym.Env):
         # --- Track map curiosity triggers for the current episode ---
         self.curiosity_triggered_maps = set()
 
+        # --- Track tile curiosity for the current episode ---
+        self.episode_visited_tiles = set()   # (map, x, y) tiles already paid out
+        self.map_tiles_discovered = {}        # map_id -> # new tiles found (decay counter)
+
         self.pyboy.tick()
 
         start_coord = self._get_current_position()
@@ -462,6 +527,10 @@ class PokemonRedEnv(gym.Env):
         # Avoid awarding curiosity for simply spawning on a monitored map
         if start_map in MONITORED_MAPS_SET:
             self.curiosity_triggered_maps.add(start_map)
+
+        # Seed the spawn tile so the agent isn't paid for the reset position.
+        self.episode_visited_tiles.add(start_coord)
+        self.map_tiles_discovered[start_map] = 1
 
         # Snapshot the whole-game event bits already set in the start state, so the LTM
         # reward vector only reflects new progress made during the episode.
@@ -481,6 +550,7 @@ class PokemonRedEnv(gym.Env):
             "coord": start_coord,
             "curiosity": 0.0,  # No curiosity on spawn; only awarded on new-map entry
             "sparse_curiosity": 0.0,
+            "tile_curiosity": 0.0,
             "events": self.max_events,
             "total_level": total_level,
             "ltm_reward": self._get_ltm_reward(),
