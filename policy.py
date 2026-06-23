@@ -16,18 +16,18 @@ class Policy(nn.Module):
         self.device = device
         self.envs = envs
         self.action_dim = envs.action_space.n
-        self.buffer_size = 1000000
+        self.buffer_size = 1500000
         self.mlp_dim = 756       # MLP width for all dense models (configurable)
         self.recurrent_dim = 2048
         self.rows = 32
         self.cols = 32
         self.latent_dim = self.rows * self.cols
         self.total_num_episodes = 10000
-        self.training_per_episodes = 300
+        self.training_per_episodes = 500
         self.seed = 42
         self.number_of_sequences = 64 # Batch size
         self.steps_per_sequence = 64
-        self.curiosity_scale = 0.5
+        self.curiosity_scale = 0.35
         self.checkpoint_interval = 2 # Save every N episodes
         
         self.visualize_dreams = visualize_dreams

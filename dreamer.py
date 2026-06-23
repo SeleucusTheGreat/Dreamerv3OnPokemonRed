@@ -1321,8 +1321,12 @@ class Dreamer:
                                pdf=None):
         best_states_device = best_states.to(self.device)
 
-        # Predicted curiosity per imagined state (map-transition head).
-        curiosities = self.two_hot.decode(self.curiosityPredictor(best_states_device)).squeeze(-1).cpu()
+        # Predicted curiosity per imagined state = map-transition head + tile head,
+        # the same sum the dream optimizes (predicted_curiosity in Dream()).
+        curiosities = (
+            self.two_hot.decode(self.curiosityPredictor(best_states_device)).squeeze(-1)
+            + self.two_hot.decode(self.tileCuriosityPredictor(best_states_device)).squeeze(-1)
+        ).cpu()
 
         decoded_imgs = self.decoder(best_states_device).clamp(0.0, 1.0).cpu()  # [horizon, 3, 64, 64]
 
@@ -1364,7 +1368,7 @@ class Dreamer:
                 lines = [
                     (icon, '#58a6ff', True),
                     (f'r :{step_reward:+.2f}', _col(step_reward), False),
-                    (f'c :{step_cur:+.3f}', '#d1f1a5', False),
+                    (f'c :{step_cur:+.4f}', '#d1f1a5', False),
                     (f'v :{step_value:.2f}', '#c9d1d9', False),
                 ]
                 if reward_advantages is not None:
@@ -1386,7 +1390,7 @@ class Dreamer:
                              fontweight='bold', color='#8b949e', transform=ax_info.transAxes)
                 ax_info.text(0.5, 0.52, step_value_str, ha='center', va='center', fontsize=9,
                              color='#c9d1d9', fontfamily='monospace', transform=ax_info.transAxes)
-                ax_info.text(0.5, 0.28, f'c :{curiosities[i].item():+.3f}', ha='center', va='center',
+                ax_info.text(0.5, 0.28, f'c :{curiosities[i].item():+.4f}', ha='center', va='center',
                              fontsize=9, color='#d1f1a5', fontfamily='monospace', transform=ax_info.transAxes)
 
         plt.subplots_adjust(top=0.85, bottom=0.05, hspace=0.15)
