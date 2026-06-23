@@ -1,7 +1,10 @@
 import os
 import glob
 import copy
+import time
+import queue
 import random
+import threading
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
@@ -23,6 +26,23 @@ def symlog(x):
 
 def symexp(x):
     return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
+
+
+def _straight_through_sample(probabilities):
+    """Hard one-hot categorical sample with a straight-through gradient.
+
+    Replaces per-timestep Independent(OneHotCategoricalStraightThrough(...)).rsample()
+    in the RSSM loop to avoid distribution-object construction overhead. `probabilities`
+    is [N, rows, cols] and already normalised over the last dim. Returns [N, rows, cols]:
+    a hard one-hot in the forward pass, with gradients flowing through `probabilities`
+    exactly as OneHotCategoricalStraightThrough does.
+    """
+    N, rows, cols = probabilities.shape
+    flat = probabilities.reshape(N * rows, cols)
+    idx = torch.multinomial(flat, 1).squeeze(-1)
+    hard = F.one_hot(idx, cols).to(probabilities.dtype).view(N, rows, cols)
+    # Straight-through: forward = hard one-hot, backward = grad w.r.t. probabilities.
+    return hard + (probabilities - probabilities.detach())
 
 
 def _mlp2(in_dim, out_dim, hidden=1024, act=nn.ELU, norm_out=True):
@@ -103,8 +123,12 @@ class EncoderImage(nn.Module):
             nn.Linear(depth * 8 * 4 * 4, output_size),
             nn.LayerNorm(output_size),
         )
+        # Lay the conv stack out for channels_last so cuDNN picks its fast kernels.
+        self.layers = self.layers.to(memory_format=torch.channels_last)
 
     def forward(self, x):
+        # Match input layout to the weights (no-op on CPU, faster convs on CUDA).
+        x = x.contiguous(memory_format=torch.channels_last)
         return self.layers(x)
 
 
@@ -123,10 +147,12 @@ class Decoder(nn.Module):
             nn.ConvTranspose2d(depth * 2, depth, 4, stride=2, padding=1), nn.ELU(),      # 16 -> 32
             nn.ConvTranspose2d(depth, 3, 4, stride=2, padding=1),                        # 32 -> 64
         )
+        self.net = self.net.to(memory_format=torch.channels_last)
 
     def forward(self, x):
         x = self.linear(x)
         x = x.view(-1, self.depth * 8, 4, 4)
+        x = x.contiguous(memory_format=torch.channels_last)
         return self.net(x)
 
 
@@ -280,8 +306,7 @@ class PriorNet(nn.Module):
         confusion = torch.ones_like(rawProbabilities) / self.cols
         probabilities = 0.99 * rawProbabilities + 0.01 * confusion
         logits = probs_to_logits(probabilities)
-        distribution = Independent(OneHotCategoricalStraightThrough(logits=logits), 1)
-        sample = distribution.rsample().view(-1, self.latentSize)
+        sample = _straight_through_sample(probabilities).view(-1, self.latentSize)
         return sample, logits
 
 
@@ -300,8 +325,7 @@ class PosteriorNet(nn.Module):
         confusion = torch.ones_like(rawProbabilities) / self.cols
         probabilities = 0.99 * rawProbabilities + 0.01 * confusion
         logits = probs_to_logits(probabilities)
-        distribution = Independent(OneHotCategoricalStraightThrough(logits=logits, validate_args=False), 1)
-        sample = distribution.rsample().view(-1, self.rows * self.cols)
+        sample = _straight_through_sample(probabilities).view(-1, self.rows * self.cols)
         return sample, logits
 
 
@@ -369,6 +393,9 @@ class Buffer(object):
         self.device = device
         self.capacity = capacity
         self.num_envs = num_envs
+        # Pin the per-batch gather only when a CUDA target exists (pinning the whole
+        # multi-GB storage would be unsafe; we pin the small sampled batch instead).
+        self._pin = torch.cuda.is_available()
         self.observations = torch.empty((capacity, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.uint8, device='cpu')
         self.ltm_rewards = torch.empty((capacity, ltm_reward_dim), dtype=torch.uint8, device='cpu')
         self.ltm_maps = torch.empty((capacity, ltm_map_dim), dtype=torch.uint8, device='cpu')
@@ -429,20 +456,26 @@ class Buffer(object):
             sample_indices.append((all_starts + seq_offsets) % self.capacity)
 
         sampleIndex = torch.cat(sample_indices, dim=0).long()
-        obs_float = self.observations[sampleIndex].to(self.device, non_blocking=True).float() / 255.0
-        return {
-            "observations": obs_float,
-            "ltm_rewards":  self.ltm_rewards[sampleIndex].to(self.device, non_blocking=True).float(),
-            "ltm_maps":     self.ltm_maps[sampleIndex].to(self.device, non_blocking=True).float(),
-            "item_counts":  self.item_counts[sampleIndex].to(self.device, non_blocking=True),
-            "team_levels":  self.team_levels[sampleIndex].to(self.device, non_blocking=True),
-            "actions":          self.actions[sampleIndex].to(self.device, non_blocking=True),
-            "sparse_rewards":     self.sparse_rewards[sampleIndex].to(self.device, non_blocking=True),
-            "standard_rewards":   self.standard_rewards[sampleIndex].to(self.device, non_blocking=True),
-            "sparse_curiosities": self.sparse_curiosities[sampleIndex].to(self.device, non_blocking=True),
-            "tile_curiosities":   self.tile_curiosities[sampleIndex].to(self.device, non_blocking=True),
-            "index":        sampleIndex.to(self.device, non_blocking=True),
+        # Gather on CPU only (the expensive part) and pin the result so the H2D copy
+        # in Dreamer._batch_to_device can be async (non_blocking) and overlap GPU
+        # compute. dtype conversions (uint8->float, /255) are done GPU-side after the
+        # transfer. The CPU gather here is what the BatchPrefetcher runs off-thread.
+        batch = {
+            "observations":       self.observations[sampleIndex],   # uint8
+            "ltm_rewards":        self.ltm_rewards[sampleIndex],     # uint8
+            "ltm_maps":           self.ltm_maps[sampleIndex],        # uint8
+            "item_counts":        self.item_counts[sampleIndex],
+            "team_levels":        self.team_levels[sampleIndex],
+            "actions":            self.actions[sampleIndex],
+            "sparse_rewards":     self.sparse_rewards[sampleIndex],
+            "standard_rewards":   self.standard_rewards[sampleIndex],
+            "sparse_curiosities": self.sparse_curiosities[sampleIndex],
+            "tile_curiosities":   self.tile_curiosities[sampleIndex],
+            "index":              sampleIndex,
         }
+        if self._pin:
+            batch = {k: v.pin_memory() for k, v in batch.items()}
+        return batch
 
     def save(self, path):
         limit = self.capacity if self.full else self.index
@@ -490,6 +523,53 @@ class Buffer(object):
         print(f"  Active Environments : {self.num_envs}")
         print(f"  Recent Sampling Window Size : {20000 * self.num_envs:,} steps")
         print("=" * 50 + "\n")
+
+
+# ==========================================================
+# BACKGROUND BATCH PREFETCHER
+# ==========================================================
+class BatchPrefetcher:
+    """Samples replay batches on a background thread so the CPU gather (the slow
+    part of Buffer.sample) overlaps GPU training instead of blocking it.
+
+    Produces pinned CPU batches; the consumer moves them to the GPU. Only safe to
+    run while the buffer is NOT being written to (i.e. during the inner training
+    loop, not during environment collection). Call close() before collecting."""
+
+    def __init__(self, buffer, batch_size, sequence_size, depth=3):
+        self.buffer = buffer
+        self.batch_size = batch_size
+        self.sequence_size = sequence_size
+        self._q = queue.Queue(maxsize=depth)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self):
+        while not self._stop.is_set():
+            batch = self.buffer.sample(self.batch_size, self.sequence_size)
+            if batch is None:
+                time.sleep(0.01)
+                continue
+            # Block until there's room, but stay responsive to close().
+            while not self._stop.is_set():
+                try:
+                    self._q.put(batch, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    def get(self):
+        return self._q.get()
+
+    def close(self):
+        self._stop.set()
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
+        self._thread.join(timeout=1.0)
 
 
 # ==========================================================
@@ -638,7 +718,19 @@ class Dreamer:
 
     # ------------------------------------------------------
     def sample_batch(self, batchSize, sequenceSize):
-        return self.buffer.sample(batchSize, sequenceSize)
+        return self._batch_to_device(self.buffer.sample(batchSize, sequenceSize))
+
+    def _batch_to_device(self, cpu_batch):
+        """Move a pinned CPU batch (from Buffer.sample / BatchPrefetcher) to the
+        training device and apply the dtype conversions that used to live in
+        Buffer.sample. With pinned memory + non_blocking the copy overlaps compute."""
+        if cpu_batch is None:
+            return None
+        out = {k: v.to(self.device, non_blocking=True) for k, v in cpu_batch.items()}
+        out["observations"] = out["observations"].float() / 255.0
+        out["ltm_rewards"] = out["ltm_rewards"].float()
+        out["ltm_maps"] = out["ltm_maps"].float()
+        return out
 
     def computeLambdaValues(self, rewards, values, continues, lambda_=0.95):
         returns = torch.zeros_like(rewards)
@@ -666,7 +758,7 @@ class Dreamer:
         )
 
     # ------------------------------------------------------
-    def TrainWorldModel(self, batch_data):
+    def TrainWorldModel(self, batch_data, compute_metrics=True):
         self.worldModelOptimizer.zero_grad(set_to_none=True)
 
         B, T = self.number_of_sequences, self.steps_per_sequence
@@ -809,21 +901,25 @@ class Dreamer:
         # Dream-start priorities: map-transition curiosity values.
         dream_priorities = batch_data["sparse_curiosities"][:, :-1].reshape(-1).detach()
 
-        metrics = {
-            "world_model_loss": world_model_loss.item(),
-            "reconstruction_loss": scaled_bt_loss.item(),
-            "reward_loss": reward_loss.item(),
-            "sparse_reward_loss": sparse_reward_loss.item(),
-            "standard_reward_loss": standard_reward_loss.item(),
-            "kl_loss": kl_loss.item(),
-            "teamitem_loss": teamitem_loss.item(),
-            "ltm_reward_loss": ltm_reward_loss.item(),
-            "ltm_map_loss": ltm_map_loss.item(),
-            "curiosity_loss": curiosity_loss.item(),
-            "sparse_curiosity_loss": sparse_curiosity_loss.item(),
-            "tile_curiosity_loss": tile_curiosity_loss.item(),
-            "decoder_loss": decoder_loss.item(),
-        }
+        # Only pull losses to the host when asked. Each .item() is a GPU->CPU sync
+        # that stalls the pipeline, so skip them on the ~299/300 steps we don't log.
+        metrics = {}
+        if compute_metrics:
+            metrics = {
+                "world_model_loss": world_model_loss.item(),
+                "reconstruction_loss": scaled_bt_loss.item(),
+                "reward_loss": reward_loss.item(),
+                "sparse_reward_loss": sparse_reward_loss.item(),
+                "standard_reward_loss": standard_reward_loss.item(),
+                "kl_loss": kl_loss.item(),
+                "teamitem_loss": teamitem_loss.item(),
+                "ltm_reward_loss": ltm_reward_loss.item(),
+                "ltm_map_loss": ltm_map_loss.item(),
+                "curiosity_loss": curiosity_loss.item(),
+                "sparse_curiosity_loss": sparse_curiosity_loss.item(),
+                "tile_curiosity_loss": tile_curiosity_loss.item(),
+                "decoder_loss": decoder_loss.item(),
+            }
         return full_states.view(-1, self.concatenated_dim).detach(), dream_priorities, metrics
 
     # -----------------------------------------------------
@@ -840,7 +936,7 @@ class Dreamer:
         newly_on = on & (prev_on < 0.5)                                # on now, never on before
         return newly_on.any(dim=-1).float()                            # [N, T]
 
-    def Dream(self, full_state, batch_data=None, horizon=20, dream_priorities=None):
+    def Dream(self, full_state, batch_data=None, horizon=20, dream_priorities=None, compute_metrics=True):
         self.actorOptimizer.zero_grad(set_to_none=True)
         self.criticOptimizer.zero_grad(set_to_none=True)
         self.curiosityCriticOptimizer.zero_grad(set_to_none=True)
@@ -969,26 +1065,34 @@ class Dreamer:
         nn.utils.clip_grad_norm_(self.actor.parameters(), 1, norm_type=2)
         self.actorOptimizer.step()
 
-        # --- EMA critic updates ---
+        # --- EMA critic updates (fused via _foreach: one kernel per critic) ---
         with torch.no_grad():
-            for param, ema_param in zip(self.critic.parameters(), self.ema_critic.parameters()):
-                ema_param.data.copy_(self.critic_ema_decay * ema_param.data + (1.0 - self.critic_ema_decay) * param.data)
-            for param, ema_param in zip(self.curiosity_critic.parameters(), self.ema_curiosity_critic.parameters()):
-                ema_param.data.copy_(self.curiosity_critic_ema_decay * ema_param.data + (1.0 - self.curiosity_critic_ema_decay) * param.data)
+            ema_params = list(self.ema_critic.parameters())
+            src_params = list(self.critic.parameters())
+            torch._foreach_mul_(ema_params, self.critic_ema_decay)
+            torch._foreach_add_(ema_params, src_params, alpha=1.0 - self.critic_ema_decay)
 
-        metrics = {
-            "actor_loss": actor_loss.item(),
-            "critic_loss": critic_loss.item(),
-            "curiosity_critic_loss": curiosity_critic_loss.item(),
-            "entropies": entropies.mean().item(),
-            "log_probabilities": log_probabilities.mean().item(),
-            "reward_advantages": reward_advantages.mean().item(),
-            "advantages": reward_advantages.mean().item(),  # alias for policy.py logging
-            "curiosity_advantages": curiosity_advantages.mean().item(),
-            "critic_values": online_values.mean().item(),
-            "curiosity_critic_values": online_curiosity_values.mean().item(),
-            "dream_mean_curiosity": predicted_curiosity.mean().item(),
-        }
+            cur_ema_params = list(self.ema_curiosity_critic.parameters())
+            cur_src_params = list(self.curiosity_critic.parameters())
+            torch._foreach_mul_(cur_ema_params, self.curiosity_critic_ema_decay)
+            torch._foreach_add_(cur_ema_params, cur_src_params, alpha=1.0 - self.curiosity_critic_ema_decay)
+
+        # Skip the host syncs on steps we don't log (see TrainWorldModel note).
+        metrics = {}
+        if compute_metrics:
+            metrics = {
+                "actor_loss": actor_loss.item(),
+                "critic_loss": critic_loss.item(),
+                "curiosity_critic_loss": curiosity_critic_loss.item(),
+                "entropies": entropies.mean().item(),
+                "log_probabilities": log_probabilities.mean().item(),
+                "reward_advantages": reward_advantages.mean().item(),
+                "advantages": reward_advantages.mean().item(),  # alias for policy.py logging
+                "curiosity_advantages": curiosity_advantages.mean().item(),
+                "critic_values": online_values.mean().item(),
+                "curiosity_critic_values": online_curiosity_values.mean().item(),
+                "dream_mean_curiosity": predicted_curiosity.mean().item(),
+            }
 
         # --- Package representative trajectories for visualization ---
         def pack(idx, metric, label):
@@ -1030,8 +1134,7 @@ class Dreamer:
         action = torch.zeros((num_envs, self.action_dim), device=self.device)
 
         observations, ltm_rewards, ltm_maps, team_levels, item_counts = [], [], [], [], []
-        for env in self.envs:
-            obs, info = env.reset()
+        for obs, info in self.envs.reset():  # all emulators reset in parallel
             observations.append(obs)
             ltm_rewards.append(np.array(info["ltm_reward"], dtype=np.float32))
             ltm_maps.append(np.array(info["ltm_map"], dtype=np.float32))
@@ -1064,57 +1167,67 @@ class Dreamer:
             action_idxs = torch.argmax(action, dim=-1).cpu().numpy()
             actions_for_buffer = action.cpu().numpy().astype(np.float32)
 
-            for i, env in enumerate(self.envs):
-                if episodes_completed[i] < number_of_episodes_per_env:
-                    next_observation, reward, terminated, truncated, next_info = env.step(action_idxs[i])
-                    done = terminated or truncated
-                    self.total_num_steps += 1
-                    current_rewards[i] += reward
-                    maps_visited[i].add(next_info["coord"][0])
-                    sparse_reward = next_info.get("sparse_reward", 0.0)
-                    standard_reward = next_info.get("standard_reward", 0.0)
-                    sparse_curiosity = next_info.get("sparse_curiosity", 0.0)
-                    tile_curiosity = next_info.get("tile_curiosity", 0.0)
-                    # Total curiosity for this episode (map-transition + tile).
-                    current_curiosities[i] += sparse_curiosity + tile_curiosity
+            # Step every still-active emulator at once (they run concurrently).
+            active = [episodes_completed[i] < number_of_episodes_per_env for i in range(num_envs)]
+            results = self.envs.step(action_idxs, active=active)
 
-                    local_buffers[i].append((
-                        observations[i].copy(), ltm_rewards[i].copy(), ltm_maps[i].copy(),
-                        item_counts[i].copy(), team_levels[i].copy(),
-                        actions_for_buffer[i].copy(), sparse_reward, standard_reward,
-                        sparse_curiosity, tile_curiosity))
+            envs_to_reset = []
+            for i in range(num_envs):
+                if not active[i]:
+                    continue
+                next_observation, reward, terminated, truncated, next_info = results[i]
+                done = terminated or truncated
+                self.total_num_steps += 1
+                current_rewards[i] += reward
+                maps_visited[i].add(next_info["coord"][0])
+                sparse_reward = next_info.get("sparse_reward", 0.0)
+                standard_reward = next_info.get("standard_reward", 0.0)
+                sparse_curiosity = next_info.get("sparse_curiosity", 0.0)
+                tile_curiosity = next_info.get("tile_curiosity", 0.0)
+                # Total curiosity for this episode (map-transition + tile).
+                current_curiosities[i] += sparse_curiosity + tile_curiosity
 
-                    observations[i] = next_observation
-                    ltm_rewards[i] = np.array(next_info["ltm_reward"], dtype=np.float32)
-                    ltm_maps[i] = np.array(next_info["ltm_map"], dtype=np.float32)
-                    team_levels[i] = np.array(next_info["team_levels"], dtype=np.float32)
-                    item_counts[i] = np.array(next_info["item_counts"], dtype=np.float32)
+                local_buffers[i].append((
+                    observations[i].copy(), ltm_rewards[i].copy(), ltm_maps[i].copy(),
+                    item_counts[i].copy(), team_levels[i].copy(),
+                    actions_for_buffer[i].copy(), sparse_reward, standard_reward,
+                    sparse_curiosity, tile_curiosity))
 
-                    if done:
-                        print(f"    [Env {i+1}] Episode done | Reward: {current_rewards[i]:.2f} | "
-                              f"Curiosity: {current_curiosities[i]:.3f} | "
-                              f"Unique maps visited: {len(maps_visited[i])} {sorted(maps_visited[i])}")
-                        maps_visited[i] = set()
-                        for transition in local_buffers[i]:
-                            self.buffer.add(*transition)
-                        local_buffers[i].clear()
-                        scores.append(current_rewards[i])
-                        curiosity_scores.append(current_curiosities[i])
-                        self.total_num_episodes += 1
-                        episodes_completed[i] += 1
+                observations[i] = next_observation
+                ltm_rewards[i] = np.array(next_info["ltm_reward"], dtype=np.float32)
+                ltm_maps[i] = np.array(next_info["ltm_map"], dtype=np.float32)
+                team_levels[i] = np.array(next_info["team_levels"], dtype=np.float32)
+                item_counts[i] = np.array(next_info["item_counts"], dtype=np.float32)
 
-                        if episodes_completed[i] < number_of_episodes_per_env:
-                            next_obs, next_info = env.reset()
-                            observations[i] = next_obs
-                            ltm_rewards[i] = np.array(next_info["ltm_reward"], dtype=np.float32)
-                            ltm_maps[i] = np.array(next_info["ltm_map"], dtype=np.float32)
-                            team_levels[i] = np.array(next_info["team_levels"], dtype=np.float32)
-                            item_counts[i] = np.array(next_info["item_counts"], dtype=np.float32)
-                            current_rewards[i] = 0.0
-                            current_curiosities[i] = 0.0
-                            recurrent_state[i] = torch.zeros(self.recurrent_dim, device=self.device)
-                            latent_state[i] = torch.zeros(self.latent_dim, device=self.device)
-                            action[i] = torch.zeros(self.action_dim, device=self.device)
+                if done:
+                    print(f"    [Env {i+1}] Episode done | Reward: {current_rewards[i]:.2f} | "
+                          f"Curiosity: {current_curiosities[i]:.3f} | "
+                          f"Unique maps visited: {len(maps_visited[i])} {sorted(maps_visited[i])}")
+                    maps_visited[i] = set()
+                    for transition in local_buffers[i]:
+                        self.buffer.add(*transition)
+                    local_buffers[i].clear()
+                    scores.append(current_rewards[i])
+                    curiosity_scores.append(current_curiosities[i])
+                    self.total_num_episodes += 1
+                    episodes_completed[i] += 1
+
+                    if episodes_completed[i] < number_of_episodes_per_env:
+                        envs_to_reset.append(i)
+                        current_rewards[i] = 0.0
+                        current_curiosities[i] = 0.0
+                        recurrent_state[i] = torch.zeros(self.recurrent_dim, device=self.device)
+                        latent_state[i] = torch.zeros(self.latent_dim, device=self.device)
+                        action[i] = torch.zeros(self.action_dim, device=self.device)
+
+            # Reset any finished envs (deferred out of the result loop; rare vs. steps).
+            for i in envs_to_reset:
+                next_obs, next_info = self.envs.reset_one(i)
+                observations[i] = next_obs
+                ltm_rewards[i] = np.array(next_info["ltm_reward"], dtype=np.float32)
+                ltm_maps[i] = np.array(next_info["ltm_map"], dtype=np.float32)
+                team_levels[i] = np.array(next_info["team_levels"], dtype=np.float32)
+                item_counts[i] = np.array(next_info["item_counts"], dtype=np.float32)
 
         for i in range(num_envs):
             for transition in local_buffers[i]:

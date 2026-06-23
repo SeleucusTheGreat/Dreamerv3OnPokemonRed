@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 IMAGE_SIZE = 64
-from dreamer import Dreamer
+from dreamer import Dreamer, BatchPrefetcher
 
 
 class Policy(nn.Module):
@@ -15,7 +15,7 @@ class Policy(nn.Module):
         super(Policy, self).__init__()
         self.device = device
         self.envs = envs
-        self.action_dim = envs[0].action_space.n 
+        self.action_dim = envs.action_space.n
         self.buffer_size = 1000000
         self.mlp_dim = 756       # MLP width for all dense models (configurable)
         self.recurrent_dim = 2048
@@ -121,25 +121,42 @@ class Policy(nn.Module):
             curiosity_dreams_of_episode = [] # Track curiosity dreams
             wm_metrics = {}
 
-            for step in range(self.training_per_episodes):
-                if step % 50 == 0:
-                    print(f"    [Training] Step {step} / {self.training_per_episodes}")
-                sample = self.dreamer.sample_batch(
-                    batchSize=self.number_of_sequences, 
-                    sequenceSize=self.steps_per_sequence
-                )
-                
-                # Update Networks
-                full_states, dream_priorities, wm_metrics = self.dreamer.TrainWorldModel(sample)
-                # Catch all three dreams (dream starts are partially prioritized by actual curiosities)
-                dream_metrics, best_dream, rand_dream, cur_dream = self.dreamer.Dream(
-                    full_states, batch_data=sample, dream_priorities=dream_priorities
-                )
-                
-                best_dreams_of_episode.append(best_dream)
-                random_dreams_of_episode.append(rand_dream)
-                curiosity_dreams_of_episode.append(cur_dream)
-                self.dreamer.total_num_updates += 1
+            # Prefetch replay batches on a background thread so the CPU gather overlaps
+            # GPU training. Safe here because the buffer is only written during
+            # Play_the_game (below), never during this inner loop.
+            prefetcher = BatchPrefetcher(
+                self.dreamer.buffer,
+                batch_size=self.number_of_sequences,
+                sequence_size=self.steps_per_sequence,
+            )
+            try:
+                for step in range(self.training_per_episodes):
+                    if step % 50 == 0:
+                        print(f"    [Training] Step {step} / {self.training_per_episodes}")
+                    # Background thread already sampled+pinned this batch; just move it
+                    # to the GPU (async via pinned memory).
+                    sample = self.dreamer._batch_to_device(prefetcher.get())
+
+                    # Only the last step's metrics are logged/printed below, so only that
+                    # step needs the (sync-heavy) .item() metric pulls.
+                    compute_metrics = (step == self.training_per_episodes - 1)
+
+                    # Update Networks
+                    full_states, dream_priorities, wm_metrics = self.dreamer.TrainWorldModel(
+                        sample, compute_metrics=compute_metrics)
+                    # Catch all three dreams (dream starts are partially prioritized by actual curiosities)
+                    dream_metrics, best_dream, rand_dream, cur_dream = self.dreamer.Dream(
+                        full_states, batch_data=sample, dream_priorities=dream_priorities,
+                        compute_metrics=compute_metrics,
+                    )
+
+                    best_dreams_of_episode.append(best_dream)
+                    random_dreams_of_episode.append(rand_dream)
+                    curiosity_dreams_of_episode.append(cur_dream)
+                    self.dreamer.total_num_updates += 1
+            finally:
+                # Stop sampling before any environment collection writes to the buffer.
+                prefetcher.close()
 
             if self.visualize_dreams:
                 # --- Visualize Half Random, Half Best ---
@@ -298,8 +315,7 @@ class Policy(nn.Module):
         ltm_maps = []
         team_levels = []
         item_counts = []
-        for env in self.envs:
-            obs, info = env.reset()
+        for obs, info in self.envs.reset():  # all emulators reset in parallel
             observations.append(obs)
             ltm_rewards.append(np.array(info["ltm_reward"], dtype=np.float32))
             ltm_maps.append(np.array(info["ltm_map"], dtype=np.float32))
@@ -325,38 +341,46 @@ class Policy(nn.Module):
                 action_onehot, _, _ = self.dreamer.actor(full_state)
                 action_idxs = torch.argmax(action_onehot, dim=-1).cpu().numpy()
                 
-            for i, env in enumerate(self.envs):
-                if episodes_completed[i] < num_episodes:
-                    obs, reward, terminated, truncated, info = env.step(action_idxs[i])
-                    done = terminated or truncated
-                    
-                    observations[i] = obs
-                    ltm_rewards[i] = np.array(info["ltm_reward"], dtype=np.float32)
-                    ltm_maps[i] = np.array(info["ltm_map"], dtype=np.float32)
-                    team_levels[i] = np.array(info["team_levels"], dtype=np.float32)
-                    item_counts[i] = np.array(info["item_counts"], dtype=np.float32)
-                    current_rewards[i] += reward
-                    steps[i] += 1
-                    
-                    if steps[i] % 500 == 0:
-                        print(f"[Agent {i+1}] Eval Step: {steps[i]}/{info['limit']} | Reward: {current_rewards[i]:.3f}")
-                        
-                    if done:
-                        print(f"--- [Agent {i+1}] Episode Finished! Reward: {current_rewards[i]:.3f} | Steps: {steps[i]} ---")
-                        episodes_completed[i] += 1
-                        
-                        if episodes_completed[i] < num_episodes:
-                            obs, info = env.reset()
-                            observations[i] = obs
-                            ltm_rewards[i] = np.array(info["ltm_reward"], dtype=np.float32)
-                            ltm_maps[i] = np.array(info["ltm_map"], dtype=np.float32)
-                            team_levels[i] = np.array(info["team_levels"], dtype=np.float32)
-                            item_counts[i] = np.array(info["item_counts"], dtype=np.float32)
-                            current_rewards[i] = 0.0
-                            steps[i] = 0
-                            recurrent_state[i] = torch.zeros(self.recurrent_dim, device=self.device)
-                            latent_state[i] = torch.zeros(self.latent_dim, device=self.device)
-                            action_onehot[i] = torch.zeros(self.action_dim, device=self.device)
+            active = [episodes_completed[i] < num_episodes for i in range(num_envs)]
+            results = self.envs.step(action_idxs, active=active)
+
+            envs_to_reset = []
+            for i in range(num_envs):
+                if not active[i]:
+                    continue
+                obs, reward, terminated, truncated, info = results[i]
+                done = terminated or truncated
+
+                observations[i] = obs
+                ltm_rewards[i] = np.array(info["ltm_reward"], dtype=np.float32)
+                ltm_maps[i] = np.array(info["ltm_map"], dtype=np.float32)
+                team_levels[i] = np.array(info["team_levels"], dtype=np.float32)
+                item_counts[i] = np.array(info["item_counts"], dtype=np.float32)
+                current_rewards[i] += reward
+                steps[i] += 1
+
+                if steps[i] % 500 == 0:
+                    print(f"[Agent {i+1}] Eval Step: {steps[i]}/{info['limit']} | Reward: {current_rewards[i]:.3f}")
+
+                if done:
+                    print(f"--- [Agent {i+1}] Episode Finished! Reward: {current_rewards[i]:.3f} | Steps: {steps[i]} ---")
+                    episodes_completed[i] += 1
+
+                    if episodes_completed[i] < num_episodes:
+                        envs_to_reset.append(i)
+                        current_rewards[i] = 0.0
+                        steps[i] = 0
+                        recurrent_state[i] = torch.zeros(self.recurrent_dim, device=self.device)
+                        latent_state[i] = torch.zeros(self.latent_dim, device=self.device)
+                        action_onehot[i] = torch.zeros(self.action_dim, device=self.device)
+
+            for i in envs_to_reset:
+                obs, info = self.envs.reset_one(i)
+                observations[i] = obs
+                ltm_rewards[i] = np.array(info["ltm_reward"], dtype=np.float32)
+                ltm_maps[i] = np.array(info["ltm_map"], dtype=np.float32)
+                team_levels[i] = np.array(info["team_levels"], dtype=np.float32)
+                item_counts[i] = np.array(info["item_counts"], dtype=np.float32)
 
     def seedMeDaddy(self, seed):
         random.seed(seed)

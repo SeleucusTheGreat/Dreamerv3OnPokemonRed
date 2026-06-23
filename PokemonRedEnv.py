@@ -3,6 +3,7 @@ from gymnasium import spaces
 import numpy as np
 import cv2
 import os
+import multiprocessing as mp
 from pyboy import PyBoy
 from pyboy.utils import WindowEvent
 
@@ -598,11 +599,163 @@ class PokemonRedEnv(gym.Env):
 START_STATE = "PokemonRed.Start.state"
 
 
-def create_envs(num_envs, rom_path, state_dir="StartingFiles", wind="null"):
+# ==========================================================
+# PARALLEL (SUBPROCESS) ENVIRONMENT EXECUTION
+# ==========================================================
+def _env_worker(conn, rom_path, state_path, image_size, window, speed, verbose):
+    """Worker entry point: owns a single PyBoy emulator and serves reset/step/close
+    commands over a pipe. Defined at module level so it is importable under the
+    'spawn' start method (required on Windows)."""
+    try:
+        env = PokemonRedEnv(
+            rom_path=rom_path, state_path=state_path, image_size=image_size,
+            window=window, speed=speed, verbose=verbose,
+        )
+    except Exception as e:  # surface construction failures to the parent
+        try:
+            conn.send(("__error__", repr(e)))
+        finally:
+            conn.close()
+        return
+
+    try:
+        while True:
+            cmd, data = conn.recv()
+            if cmd == "step":
+                conn.send(env.step(data))
+            elif cmd == "reset":
+                conn.send(env.reset())
+            elif cmd == "close":
+                break
+            else:
+                conn.send(("__error__", f"unknown command {cmd!r}"))
+    except (EOFError, KeyboardInterrupt):
+        pass
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass
+        conn.close()
+
+
+class ParallelPokemonEnvs:
+    """Runs each PyBoy emulator in its own process so they step concurrently.
+
+    Exposes the small interface the trainer needs: len(), action_space,
+    reset() / reset_one(i) / step(action_idxs, active) / close(). step() dispatches
+    every active env's command before reading any reply, so the emulators advance in
+    parallel rather than one after another."""
+
+    def __init__(self, num_envs, rom_path, state_path, image_size=64,
+                 window="null", speed=0, verbose=False):
+        ctx = mp.get_context("spawn")  # PyBoy is not fork-safe; spawn works on Windows too
+        self.num_envs = num_envs
+        self.action_space = spaces.Discrete(6)
+        self.observation_space = spaces.Box(
+            low=0, high=255, shape=(3, image_size, image_size), dtype=np.uint8)
+        self._parents = []
+        self._procs = []
+        for _ in range(num_envs):
+            parent, child = ctx.Pipe()
+            proc = ctx.Process(
+                target=_env_worker,
+                args=(child, rom_path, state_path, image_size, window, speed, verbose),
+                daemon=True,
+            )
+            proc.start()
+            child.close()  # only the worker keeps the child end
+            self._parents.append(parent)
+            self._procs.append(proc)
+
+    def __len__(self):
+        return self.num_envs
+
+    @staticmethod
+    def _check(result):
+        if (isinstance(result, tuple) and len(result) == 2
+                and isinstance(result[0], str) and result[0] == "__error__"):
+            raise RuntimeError(f"Env worker error: {result[1]}")
+        return result
+
+    def reset(self):
+        for p in self._parents:
+            p.send(("reset", None))
+        return [self._check(p.recv()) for p in self._parents]
+
+    def reset_one(self, i):
+        self._parents[i].send(("reset", None))
+        return self._check(self._parents[i].recv())
+
+    def step(self, action_idxs, active=None):
+        if active is None:
+            active = [True] * self.num_envs
+        # Dispatch all step commands first (emulators run concurrently)...
+        for i, p in enumerate(self._parents):
+            if active[i]:
+                p.send(("step", int(action_idxs[i])))
+        # ...then collect the results.
+        results = [None] * self.num_envs
+        for i, p in enumerate(self._parents):
+            if active[i]:
+                results[i] = self._check(p.recv())
+        return results
+
+    def close(self):
+        for p in self._parents:
+            try:
+                p.send(("close", None))
+            except (BrokenPipeError, OSError):
+                pass
+        for proc in self._procs:
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.terminate()
+
+
+class SequentialPokemonEnvs:
+    """Same interface as ParallelPokemonEnvs but runs every emulator in-process,
+    one after another. Kept as a debugging / single-process fallback."""
+
+    def __init__(self, envs):
+        self._envs = envs
+        self.num_envs = len(envs)
+        self.action_space = envs[0].action_space
+        self.observation_space = envs[0].observation_space
+
+    def __len__(self):
+        return self.num_envs
+
+    def reset(self):
+        return [e.reset() for e in self._envs]
+
+    def reset_one(self, i):
+        return self._envs[i].reset()
+
+    def step(self, action_idxs, active=None):
+        if active is None:
+            active = [True] * self.num_envs
+        results = [None] * self.num_envs
+        for i, e in enumerate(self._envs):
+            if active[i]:
+                results[i] = e.step(int(action_idxs[i]))
+        return results
+
+    def close(self):
+        for e in self._envs:
+            e.close()
+
+
+def create_envs(num_envs, rom_path, state_dir="StartingFiles", wind="null", parallel=True):
     """Create `num_envs` environments, all loading exclusively from PokemonRed.Start.state.
 
     This project intentionally supports a single start state. No other .state files
     exist or are accepted.
+
+    parallel=True (default) returns a ParallelPokemonEnvs manager that runs each
+    emulator in its own process so collection steps them concurrently. parallel=False
+    returns an equivalent SequentialPokemonEnvs wrapper (single process) for debugging.
+    Both expose the same reset/step/close interface used by the trainer.
     """
     state_path = os.path.join(state_dir, START_STATE)
     if not os.path.exists(state_path):
@@ -611,17 +764,21 @@ def create_envs(num_envs, rom_path, state_dir="StartingFiles", wind="null"):
             f"Only '{START_STATE}' is supported."
         )
 
-    envs = []
-    print(f"Initializing {num_envs} PyBoy Environments (all using {START_STATE})...")
+    print(f"Initializing {num_envs} PyBoy Environments (all using {START_STATE}, "
+          f"parallel={parallel})...")
 
-    for i in range(num_envs):
-        env = PokemonRedEnv(
-            rom_path=rom_path,
-            state_path=state_path,
-            verbose=True,
-            window=wind,
-            speed=0,
+    if parallel:
+        return ParallelPokemonEnvs(
+            num_envs=num_envs, rom_path=rom_path, state_path=state_path,
+            window=wind, speed=0, verbose=True,
         )
-        envs.append(env)
 
-    return envs
+    envs = [
+        PokemonRedEnv(
+            rom_path=rom_path, state_path=state_path,
+            verbose=True, window=wind, speed=0,
+        )
+        for _ in range(num_envs)
+    ]
+    return SequentialPokemonEnvs(envs)
+# (parallel/sequential env managers defined above)
