@@ -1091,6 +1091,39 @@ class Dreamer:
             ema_probs * (torch.log_softmax(ema_critic_logits, dim=-1) - torch.log_softmax(critic_logits_to_train, dim=-1)), dim=-1))
         critic_loss = critic_loss_main + critic_ema_reg
 
+        # --- Critic replay loss (repval, DreamerV3) — REWARD CRITIC ONLY ---
+        # Grounds the reward critic on REAL replay rewards rather than only on
+        # imagined rollouts (where the actor can climb a self-made value ramp).
+        # We compute lambda-returns over the real buffer rewards using the
+        # current critic's values on the real replayed states as on-policy value
+        # annotations, then regress the critic toward them at beta=0.3 (paper's
+        # scale). The real reward events anchor the scale, and on zero-reward
+        # segments the detached-value bootstrap with gamma<1 contracts toward 0,
+        # which is the grounding the imagination-only loss lacks.
+        # NOTE: the paper uses the imagined returns Rlambda at the rollout start
+        # states as the annotations; here we use the detached online critic value
+        # (the standard, cheaper TD(lambda)-on-replay equivalent) because the
+        # imagination rollout above is run on prioritization-reshuffled starts
+        # and no longer aligns to the [B, T-1] replay grid.
+        repval_loss = torch.zeros((), device=self.device)
+        if batch_data is not None and "standard_rewards" in batch_data:
+            B = self.number_of_sequences
+            Tr = self.steps_per_sequence - 1
+            if full_state.shape[0] == B * Tr and Tr >= 2:
+                real_states = full_state.detach().view(B, Tr, self.concatenated_dim)
+                real_rewards = (batch_data["sparse_rewards"][:, 1:]
+                                + batch_data["standard_rewards"][:, 1:]).squeeze(-1)  # [B, Tr]
+                with torch.no_grad():
+                    v_real = self.two_hot.decode(self.critic(real_states)).squeeze(-1)  # [B, Tr]
+                    replay_continues = torch.full_like(real_rewards[:, :-1], 0.997)
+                    replay_returns = self.computeLambdaValues(
+                        real_rewards[:, :-1], v_real, replay_continues)                 # [B, Tr-1]
+                    replay_target_two_hot = self.two_hot.encode(replay_returns)
+                replay_logits = self.critic(real_states[:, :-1])                        # [B, Tr-1, bins]
+                repval_loss = -torch.mean(torch.sum(
+                    replay_target_two_hot * torch.log_softmax(replay_logits, dim=-1), dim=-1))
+        critic_loss = critic_loss + 0.3 * repval_loss
+
         # --- Curiosity critic loss (CE to lambda returns + EMA KL anchor) ---
         curiosity_critic_logits_to_train = self.curiosity_critic(imagined_states)[:, :-1]
         target_curiosity_values_two_hot = self.two_hot.encode(curiosity_lambda_values.detach())
@@ -1134,6 +1167,7 @@ class Dreamer:
             metrics = {
                 "actor_loss": actor_loss.item(),
                 "critic_loss": critic_loss.item(),
+                "repval_loss": repval_loss.item(),
                 "curiosity_critic_loss": curiosity_critic_loss.item(),
                 "entropies": entropies.mean().item(),
                 "log_probabilities": log_probabilities.mean().item(),
