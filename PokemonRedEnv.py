@@ -399,6 +399,12 @@ class PokemonRedEnv(gym.Env):
         sparse_reward = 0.000
         standard_reward = 0.000
 
+        # Verbose reward/curiosity messages are COLLECTED here and shipped back to
+        # the parent process in info["logs"]. Under parallel (subprocess) env
+        # training, prints inside this worker process are not captured by the
+        # notebook/console, so the main process prints these instead.
+        logs = []
+
         coord = self._get_current_position()
         map_id, x, y = coord
         
@@ -410,7 +416,7 @@ class PokemonRedEnv(gym.Env):
             self.curiosity_triggered_maps.add(map_id)
             if self.verbose:
                 map_name = MAP_NAMES.get(map_id, f"Map ID {map_id}")
-                print(f"[CURIOSITY BONUS] +{MAP_CURIOSITY_BONUS} awarded for transitioning to {map_name}")
+                logs.append(f"[CURIOSITY BONUS] +{MAP_CURIOSITY_BONUS} awarded for transitioning to {map_name}")
 
         # --- Local exploration grid: read BEFORE marking the current tile, so the
         # center cell is 0 exactly on the step the agent enters a brand-new tile.
@@ -441,14 +447,14 @@ class PokemonRedEnv(gym.Env):
                 idx = int(idx)
                 addr = RAM_EVENTS_REGION_START + idx // 8
                 bit = idx % 8
-                print(f"[EVENT REWARD] Triggered by Memory Address: {hex(addr)}, Bit: {bit} (LTM idx {idx})")
+                logs.append(f"[EVENT REWARD] Triggered by Memory Address: {hex(addr)}, Bit: {bit} (LTM idx {idx})")
 
             self.max_step_limit += (new_events * self.step_increase)
             self.max_events = current_events
             sparse_reward += event_reward_gain
 
             if self.verbose:
-                print(f"[EVENT] +{event_reward_gain:.3f} | Budget: {self.max_step_limit}")
+                logs.append(f"[EVENT] +{event_reward_gain:.3f} | Budget: {self.max_step_limit}")
 
         self.last_event_bits = current_event_bits
 
@@ -461,7 +467,7 @@ class PokemonRedEnv(gym.Env):
             # we add +50 to make the total +200.
             sparse_reward += 50.0
             if self.verbose:
-                print(f"[BROCK DEFEAT] +50.0 added (total 100.0 for beating Brock)")
+                logs.append("[BROCK DEFEAT] +50.0 added (total 100.0 for beating Brock)")
 
         # PARTY HEALING REWARD
         total_level, hp_fraction_sum, party_count = self._get_party_info()
@@ -490,7 +496,7 @@ class PokemonRedEnv(gym.Env):
             self.episode_level_ups += 1  
             
             if self.verbose:
-                print(f"[LEVEL] +{decayed_lvl_gain:.3f} | Total Party Level up to: {total_level}")
+                logs.append(f"[LEVEL] +{decayed_lvl_gain:.3f} | Total Party Level up to: {total_level}")
 
         # ITEM REWARD
         if not self.has_obtained_pokeball:
@@ -498,7 +504,7 @@ class PokemonRedEnv(gym.Env):
                 self.has_obtained_pokeball = True
                 sparse_reward += 50.0
                 if self.verbose:
-                    print("[ITEM] +50.0 | Obtained first Pokéball!")
+                    logs.append("[ITEM] +50.0 | Obtained first Pokéball!")
 
         # Total env reward is the sum of the two streams (unchanged externally).
         step_reward = sparse_reward + standard_reward
@@ -523,6 +529,7 @@ class PokemonRedEnv(gym.Env):
             "ltm_map": self._get_ltm_map(),
             "team_levels": self._get_team_levels(),
             "item_counts": self._get_item_counts(),
+            "logs": logs,                                     # verbose msgs for the parent to print
         }
 
         return obs, step_reward, terminated, False, info
@@ -585,6 +592,7 @@ class PokemonRedEnv(gym.Env):
             "ltm_map": self._get_ltm_map(),
             "team_levels": self._get_team_levels(),
             "item_counts": self._get_item_counts(),
+            "logs": [],
         }
         return self._get_obs(), info
 

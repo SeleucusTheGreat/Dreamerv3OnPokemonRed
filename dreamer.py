@@ -421,8 +421,6 @@ class Buffer(object):
         self.device = device
         self.capacity = capacity
         self.num_envs = num_envs
-        # Pin the per-batch gather only when a CUDA target exists (pinning the whole
-        # multi-GB storage would be unsafe; we pin the small sampled batch instead).
         self._pin = torch.cuda.is_available()
         self.observations = torch.empty((capacity, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.uint8, device='cpu')
         self.ltm_rewards = torch.empty((capacity, ltm_reward_dim), dtype=torch.uint8, device='cpu')
@@ -654,8 +652,8 @@ class Dreamer:
         self.ltm_sparsity_weight = 0.5
 
         # Exploration: fraction of dream starts resampled from high-novelty states.
-        self.dream_priority_fraction = 0.1
-        self.dream_reward_priority_fraction = 0.1
+        self.dream_priority_fraction = 0.05
+        self.dream_reward_priority_fraction = 0.05
 
         # Dream sparse-reward curiosity gating
         self.ltm_gate_threshold = 0.3
@@ -680,11 +678,9 @@ class Dreamer:
         self.grid_encoder = GridEncoder(GRID_DIM, self.grid_out, hidden=self.mlp_dim).to(self.device)
 
         # --- Predictors (latent -> observation components) ---
-        # Single-head reward predictors (no ensemble). Curiosity heads are already single.
         self.sparseRewardPredictor = RewardPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
         self.standardRewardPredictor = RewardPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
         self.curiosityPredictor = CuriosityPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
-        # Second curiosity head: dense intra-map tile curiosity (un-gated in dreams).
         self.tileCuriosityPredictor = CuriosityPredictor(self.concatenated_dim, mlp_dim=self.mlp_dim).to(self.device)
         self.teamitemPredictor = TeamItemPredictor(self.concatenated_dim, self.team_dim + self.item_dim, hidden=self.mlp_dim).to(self.device)
         self.ltm_reward_predictor = LongTermMemoryPredictor(self.concatenated_dim, LTM_REWARD_DIM, hidden=self.mlp_dim).to(self.device)
@@ -1056,10 +1052,6 @@ class Dreamer:
             # Map-transition curiosity is gated by map-memory novelty.
             curiosity_gate = self._newly_activated_mask(map_ltm_logits, self.ltm_gate_threshold)
             sparse_curiosity = sparse_curiosity * curiosity_gate
-            # Tile curiosity is gated by the grid predictor's CENTER cell: if the
-            # imagined step lands on a tile predicted UNEXPLORED (p(explored) below
-            # threshold), the static tile bonus is paid; otherwise it is suppressed.
-            # This mirrors the LTM-gated sparse rewards but for intra-map novelty.
             grid_logits = self.grid_predictor(imagined_steps)             # [N, T, GRID_DIM]
             center_explored_prob = torch.sigmoid(grid_logits[..., GRID_CENTER_INDEX])
             tile_gate = (center_explored_prob < self.grid_gate_threshold).float()
@@ -1072,7 +1064,7 @@ class Dreamer:
 
         # --- Lambda returns ---
         with torch.no_grad():
-            continues = torch.full_like(predicted_rewards, 0.999)
+            continues = torch.full_like(predicted_rewards, 0.997)
             lambda_values = self.computeLambdaValues(predicted_rewards, online_values, continues)
             curiosity_lambda_values = self.computeLambdaValues(predicted_curiosity, online_curiosity_values, continues)
 
@@ -1238,6 +1230,8 @@ class Dreamer:
                     continue
                 next_observation, reward, terminated, truncated, next_info = results[i]
                 done = terminated or truncated
+                for msg in next_info.get("logs", ()):
+                    print(f"    [Env {i+1}] {msg}")
                 self.total_num_steps += 1
                 current_rewards[i] += reward
                 maps_visited[i].add(next_info["coord"][0])
@@ -1383,10 +1377,6 @@ class Dreamer:
                                reward_advantages=None, curiosity_advantages=None, title_prefix="Dream",
                                pdf=None):
         best_states_device = best_states.to(self.device)
-
-        # Predicted curiosity per imagined state = map-transition head + grid-gated
-        # tile head, matching the sum the dream optimizes (predicted_curiosity in
-        # Dream()). The tile bonus is gated by the grid predictor's center cell.
         grid_logits = self.grid_predictor(best_states_device)
         center_explored_prob = torch.sigmoid(grid_logits[..., GRID_CENTER_INDEX])
         tile_gate = (center_explored_prob < self.grid_gate_threshold).float()
