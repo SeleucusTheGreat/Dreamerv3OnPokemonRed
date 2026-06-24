@@ -169,16 +169,23 @@ MAP_NAMES = {
 # enters each monitored map.
 MAP_CURIOSITY_BONUS = 1.0
 
-# Tile (intra-map) curiosity: a dense, fast-decaying exploration bonus granted
-# the first time each (map, x, y) tile is stepped on this episode. The bonus
-# decays per *new tile already discovered in the same map*, so the first few
-# tiles of a fresh map pay ~TILE_CURIOSITY_BONUS and a well-trodden map is
-# quickly exhausted. Entering a new map resets the decay (its tile counter
-# starts at 0), which is why this rewards moving on rather than pacing.
-#   bonus(tile) = TILE_CURIOSITY_BONUS * TILE_CURIOSITY_DECAY ** (tiles_seen_in_map)
-# Tune TILE_CURIOSITY_DECAY in (0,1): smaller = exhausts the map faster.
+# Tile (intra-map) curiosity: a dense, STATIC exploration bonus granted the first
+# time each (map, x, y) tile is stepped on this episode. No decay: every newly
+# visited tile pays exactly TILE_CURIOSITY_BONUS. Localising *where* this bonus
+# fires in the dream is delegated to the grid predictor's center-cell gate
+# (see Dreamer.Dream), mirroring how the LTM predictors gate the sparse rewards.
 TILE_CURIOSITY_BONUS = 0.01
-TILE_CURIOSITY_DECAY = 0.97
+
+# Local exploration grid: a 3x3 (9-cell) agent-centered binary map where each
+# cell is 1.0 if that absolute (map, x+dx, y+dy) tile has been visited THIS
+# episode and 0.0 otherwise. Fed to the posterior as an encoder input AND
+# reconstructed by the grid predictor. The grid is read BEFORE the current tile
+# is marked visited, so the CENTER cell is 0 exactly on the step the agent
+# enters a brand-new tile (the tile-curiosity event the gate must localise).
+GRID_RADIUS = 1
+GRID_SIDE = 2 * GRID_RADIUS + 1          # 3
+GRID_DIM = GRID_SIDE * GRID_SIDE         # 9
+GRID_CENTER_INDEX = GRID_DIM // 2        # 4
 
 
 class PokemonRedEnv(gym.Env):
@@ -316,6 +323,23 @@ class PokemonRedEnv(gym.Env):
         y = self.pyboy.memory[self.RAM_PLAYER_Y]
         return (map_id, x, y)
 
+    def _get_explored_grid(self, coord):
+        """3x3 agent-centered binary explored grid (row-major over dy, then dx).
+
+        Cell value is 1.0 if the absolute (map, x+dx, y+dy) tile is already in
+        this episode's visited set, else 0.0. Read this BEFORE adding the current
+        tile to episode_visited_tiles so the center cell (index GRID_CENTER_INDEX)
+        is 0 exactly when the agent has just stepped onto a brand-new tile."""
+        map_id, x, y = coord
+        grid = np.zeros(GRID_DIM, dtype=np.float32)
+        idx = 0
+        for dy in range(-GRID_RADIUS, GRID_RADIUS + 1):
+            for dx in range(-GRID_RADIUS, GRID_RADIUS + 1):
+                if (map_id, x + dx, y + dy) in self.episode_visited_tiles:
+                    grid[idx] = 1.0
+                idx += 1
+        return grid
+
     def _get_party_info(self):
         party_count = min(max(self.pyboy.memory[self.RAM_PARTY_COUNT], 0), 6)
         total_level = 0
@@ -388,16 +412,19 @@ class PokemonRedEnv(gym.Env):
                 map_name = MAP_NAMES.get(map_id, f"Map ID {map_id}")
                 print(f"[CURIOSITY BONUS] +{MAP_CURIOSITY_BONUS} awarded for transitioning to {map_name}")
 
-        # --- Tile curiosity: dense, fast-decaying bonus the first time each
-        # (map, x, y) tile is visited this episode. Kept separate from the
-        # map-transition bonus so the dream can credit it WITHOUT the map-novelty
-        # gate (intra-map tiles never flip a map memory bit). ---
+        # --- Local exploration grid: read BEFORE marking the current tile, so the
+        # center cell is 0 exactly on the step the agent enters a brand-new tile.
+        # This is the signal the grid predictor's center-cell gate localises. ---
+        explored_grid = self._get_explored_grid(coord)
+
+        # --- Tile curiosity: dense, STATIC bonus the first time each (map, x, y)
+        # tile is visited this episode. Kept separate from the map-transition
+        # bonus so the dream credits it via the grid (center-cell) gate rather
+        # than the map-novelty gate (intra-map tiles never flip a map bit). ---
         tile_curiosity = 0.0
         if coord not in self.episode_visited_tiles:
             self.episode_visited_tiles.add(coord)
-            tiles_seen = self.map_tiles_discovered.get(map_id, 0)
-            tile_curiosity = TILE_CURIOSITY_BONUS * (TILE_CURIOSITY_DECAY ** tiles_seen)
-            self.map_tiles_discovered[map_id] = tiles_seen + 1
+            tile_curiosity = TILE_CURIOSITY_BONUS  # static, no decay
 
         self.visited_maps.add(map_id)
 
@@ -487,7 +514,8 @@ class PokemonRedEnv(gym.Env):
             "tile_curiosity": tile_curiosity,                 # intra-map exploration
             "sparse_reward": sparse_reward,
             "standard_reward": standard_reward,
-            "steps": self.current_step, 
+            "grid": explored_grid,                            # 3x3 explored grid
+            "steps": self.current_step,
             "limit": self.max_step_limit,
             "events": current_events,
             "total_level": total_level,
@@ -517,7 +545,6 @@ class PokemonRedEnv(gym.Env):
 
         # --- Track tile curiosity for the current episode ---
         self.episode_visited_tiles = set()   # (map, x, y) tiles already paid out
-        self.map_tiles_discovered = {}        # map_id -> # new tiles found (decay counter)
 
         self.pyboy.tick()
 
@@ -531,7 +558,6 @@ class PokemonRedEnv(gym.Env):
 
         # Seed the spawn tile so the agent isn't paid for the reset position.
         self.episode_visited_tiles.add(start_coord)
-        self.map_tiles_discovered[start_map] = 1
 
         # Snapshot the whole-game event bits already set in the start state, so the LTM
         # reward vector only reflects new progress made during the episode.
@@ -552,6 +578,7 @@ class PokemonRedEnv(gym.Env):
             "curiosity": 0.0,  # No curiosity on spawn; only awarded on new-map entry
             "sparse_curiosity": 0.0,
             "tile_curiosity": 0.0,
+            "grid": self._get_explored_grid(start_coord),  # center=1 (spawn already visited)
             "events": self.max_events,
             "total_level": total_level,
             "ltm_reward": self._get_ltm_reward(),

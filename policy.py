@@ -16,18 +16,18 @@ class Policy(nn.Module):
         self.device = device
         self.envs = envs
         self.action_dim = envs.action_space.n
-        self.buffer_size = 1500000
+        self.buffer_size = 1000000
         self.mlp_dim = 756       # MLP width for all dense models (configurable)
         self.recurrent_dim = 2048
-        self.rows = 32
-        self.cols = 32
+        self.rows = 40
+        self.cols = 40
         self.latent_dim = self.rows * self.cols
         self.total_num_episodes = 10000
         self.training_per_episodes = 500
         self.seed = 42
         self.number_of_sequences = 64 # Batch size
         self.steps_per_sequence = 64
-        self.curiosity_scale = 0.35
+        self.curiosity_scale = 0.25
         self.checkpoint_interval = 2 # Save every N episodes
         
         self.visualize_dreams = visualize_dreams
@@ -313,12 +313,14 @@ class Policy(nn.Module):
         observations = []
         ltm_rewards = []
         ltm_maps = []
+        grids = []
         team_levels = []
         item_counts = []
         for obs, info in self.envs.reset():  # all emulators reset in parallel
             observations.append(obs)
             ltm_rewards.append(np.array(info["ltm_reward"], dtype=np.float32))
             ltm_maps.append(np.array(info["ltm_map"], dtype=np.float32))
+            grids.append(np.array(info["grid"], dtype=np.float32))
             team_levels.append(np.array(info["team_levels"], dtype=np.float32))
             item_counts.append(np.array(info["item_counts"], dtype=np.float32))
 
@@ -326,13 +328,14 @@ class Policy(nn.Module):
             obs_tensor = (torch.from_numpy(np.array(observations)).float() / 255.0).to(self.device)
             ltm_reward_tensor = torch.from_numpy(np.array(ltm_rewards)).float().to(self.device)
             ltm_map_tensor = torch.from_numpy(np.array(ltm_maps)).float().to(self.device)
+            grid_tensor = torch.from_numpy(np.array(grids)).float().to(self.device)
             team_tensor = torch.from_numpy(np.array(team_levels)).float().to(self.device)
             item_tensor = torch.from_numpy(np.array(item_counts)).float().to(self.device)
 
             with torch.no_grad():
-                enc_img, enc_teamitem, enc_ltm_reward, enc_ltm_map = self.dreamer._encode_components(
-                    obs_tensor, ltm_reward_tensor, ltm_map_tensor, team_tensor, item_tensor)
-                encoded_obs = torch.cat([enc_img, enc_teamitem, enc_ltm_reward, enc_ltm_map], dim=-1)
+                enc_img, enc_teamitem, enc_ltm_reward, enc_ltm_map, enc_grid = self.dreamer._encode_components(
+                    obs_tensor, ltm_reward_tensor, ltm_map_tensor, grid_tensor, team_tensor, item_tensor)
+                encoded_obs = torch.cat([enc_img, enc_teamitem, enc_ltm_reward, enc_ltm_map, enc_grid], dim=-1)
 
                 recurrent_state = self.dreamer.recurrentModel(recurrent_state, latent_state, action_onehot)
                 latent_state, _ = self.dreamer.posteriorNet(torch.cat((recurrent_state, encoded_obs), -1))
@@ -354,6 +357,7 @@ class Policy(nn.Module):
                 observations[i] = obs
                 ltm_rewards[i] = np.array(info["ltm_reward"], dtype=np.float32)
                 ltm_maps[i] = np.array(info["ltm_map"], dtype=np.float32)
+                grids[i] = np.array(info["grid"], dtype=np.float32)
                 team_levels[i] = np.array(info["team_levels"], dtype=np.float32)
                 item_counts[i] = np.array(info["item_counts"], dtype=np.float32)
                 current_rewards[i] += reward
@@ -379,6 +383,7 @@ class Policy(nn.Module):
                 observations[i] = obs
                 ltm_rewards[i] = np.array(info["ltm_reward"], dtype=np.float32)
                 ltm_maps[i] = np.array(info["ltm_map"], dtype=np.float32)
+                grids[i] = np.array(info["grid"], dtype=np.float32)
                 team_levels[i] = np.array(info["team_levels"], dtype=np.float32)
                 item_counts[i] = np.array(info["item_counts"], dtype=np.float32)
 

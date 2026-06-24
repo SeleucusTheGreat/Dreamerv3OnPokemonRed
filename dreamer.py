@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.distributions import Independent, kl_divergence, OneHotCategoricalStraightThrough, OneHotCategorical
 from torch.distributions.utils import probs_to_logits
 
-from PokemonRedEnv import LTM_REWARD_DIM, LTM_MAP_DIM
+from PokemonRedEnv import LTM_REWARD_DIM, LTM_MAP_DIM, GRID_DIM, GRID_CENTER_INDEX
 
 IMAGE_SIZE = 64
 
@@ -224,6 +224,34 @@ class LongTermMapPredictor(nn.Module):
         return self.net(x)
 
 
+class GridEncoder(nn.Module):
+    """Local 3x3 explored-grid encoder (agent-centered exploration map, feature #grid)."""
+    def __init__(self, in_dim=GRID_DIM, out_dim=128, hidden=1024):
+        super().__init__()
+        self.net = _mlp2(in_dim, out_dim, hidden=hidden)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class GridPredictor(nn.Module):
+    """Local 3x3 explored-grid predictor (per-cell explored logits).
+
+    Decodes the agent-centered explored grid from the latent state. The dream
+    gates the tile curiosity by this head's CENTER cell: a predicted-unexplored
+    center means the imagined step lands on a brand-new tile (where the static
+    tile bonus should be paid), mirroring how the LTM predictors gate the sparse
+    rewards. Last layer is zero-init so every cell starts at p=0.5."""
+    def __init__(self, input_size, out_dim=GRID_DIM, hidden=1024):
+        super().__init__()
+        self.net = _mlp2(input_size, out_dim, hidden=hidden, act=nn.SiLU, norm_out=False)
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x):
+        return self.net(x)
+
+
 # ==========================================================
 # REWARD / CURIOSITY HEADS
 # ==========================================================
@@ -389,7 +417,7 @@ class DynamicDataNormalizer(nn.Module):
 class Buffer(object):
     def __init__(self, device, capacity=800000, actionSize=6,
                  ltm_reward_dim=LTM_REWARD_DIM, ltm_map_dim=LTM_MAP_DIM,
-                 item_dim=2, team_level_dim=6, num_envs=4):
+                 item_dim=2, team_level_dim=6, num_envs=4, grid_dim=GRID_DIM):
         self.device = device
         self.capacity = capacity
         self.num_envs = num_envs
@@ -399,6 +427,7 @@ class Buffer(object):
         self.observations = torch.empty((capacity, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=torch.uint8, device='cpu')
         self.ltm_rewards = torch.empty((capacity, ltm_reward_dim), dtype=torch.uint8, device='cpu')
         self.ltm_maps = torch.empty((capacity, ltm_map_dim), dtype=torch.uint8, device='cpu')
+        self.grids = torch.empty((capacity, grid_dim), dtype=torch.uint8, device='cpu')
         self.item_counts = torch.empty((capacity, item_dim), dtype=torch.float32, device='cpu')
         self.team_levels = torch.empty((capacity, team_level_dim), dtype=torch.float32, device='cpu')
         self.actions = torch.empty((capacity, actionSize), dtype=torch.float32, device='cpu')
@@ -410,11 +439,12 @@ class Buffer(object):
         self.index = 0
         self.full = False
 
-    def add(self, observation, ltm_reward, ltm_map, item_count, team_level, action,
+    def add(self, observation, ltm_reward, ltm_map, grid, item_count, team_level, action,
             sparse_reward, standard_reward, sparse_curiosity, tile_curiosity):
         self.observations[self.index] = torch.as_tensor(observation, dtype=torch.uint8)
         self.ltm_rewards[self.index] = torch.as_tensor(ltm_reward, dtype=torch.uint8)
         self.ltm_maps[self.index] = torch.as_tensor(ltm_map, dtype=torch.uint8)
+        self.grids[self.index] = torch.as_tensor(grid, dtype=torch.uint8)
         self.item_counts[self.index] = torch.as_tensor(item_count, dtype=torch.float32)
         self.team_levels[self.index] = torch.as_tensor(team_level, dtype=torch.float32)
         self.actions[self.index] = torch.as_tensor(action, dtype=torch.float32)
@@ -464,6 +494,7 @@ class Buffer(object):
             "observations":       self.observations[sampleIndex],   # uint8
             "ltm_rewards":        self.ltm_rewards[sampleIndex],     # uint8
             "ltm_maps":           self.ltm_maps[sampleIndex],        # uint8
+            "grids":              self.grids[sampleIndex],           # uint8
             "item_counts":        self.item_counts[sampleIndex],
             "team_levels":        self.team_levels[sampleIndex],
             "actions":            self.actions[sampleIndex],
@@ -483,6 +514,7 @@ class Buffer(object):
             'observations': self.observations[:limit],
             'ltm_rewards': self.ltm_rewards[:limit],
             'ltm_maps': self.ltm_maps[:limit],
+            'grids': self.grids[:limit],
             'item_counts': self.item_counts[:limit],
             'team_levels': self.team_levels[:limit],
             'actions': self.actions[:limit],
@@ -497,7 +529,7 @@ class Buffer(object):
     def load(self, path):
         ckpt = torch.load(path, map_location='cpu')
         n = min(ckpt['observations'].shape[0], self.capacity)
-        for name in ('observations', 'ltm_rewards', 'ltm_maps', 'item_counts',
+        for name in ('observations', 'ltm_rewards', 'ltm_maps', 'grids', 'item_counts',
                      'team_levels', 'actions', 'sparse_rewards', 'standard_rewards',
                      'sparse_curiosities', 'tile_curiosities'):
             if name in ckpt:
@@ -599,10 +631,12 @@ class Dreamer:
         self.teamitem_out = 256
         self.ltm_reward_out = 512
         self.ltm_map_out = 512
+        self.grid_out = 128
         self.team_dim = team_dim
         self.item_dim = item_dim
         self.enconder_output_size = (self.image_out + self.teamitem_out
-                                     + self.ltm_reward_out + self.ltm_map_out)
+                                     + self.ltm_reward_out + self.ltm_map_out
+                                     + self.grid_out)
 
         self.entropy_scale = 0.002
         self.number_of_sequences = number_of_sequences
@@ -620,11 +654,15 @@ class Dreamer:
         self.ltm_sparsity_weight = 0.5
 
         # Exploration: fraction of dream starts resampled from high-novelty states.
-        self.dream_priority_fraction = 0.02
-        self.dream_reward_priority_fraction = 0.02
+        self.dream_priority_fraction = 0.1
+        self.dream_reward_priority_fraction = 0.1
 
         # Dream sparse-reward curiosity gating
         self.ltm_gate_threshold = 0.3
+        # Dream tile-curiosity gating: the grid predictor's center cell must read
+        # as UNEXPLORED (predicted p(explored) < threshold) for the imagined step
+        # to be credited the static tile bonus.
+        self.grid_gate_threshold = 0.5
 
         # --- Encodings ---
         self.two_hot = TwoHotEncoding(device=self.device)
@@ -639,6 +677,7 @@ class Dreamer:
         self.teamitem_encoder = TeamItemEncoder(self.team_dim + self.item_dim, self.teamitem_out, hidden=self.mlp_dim).to(self.device)
         self.ltm_reward_encoder = LongTermMemoryEncoder(LTM_REWARD_DIM, self.ltm_reward_out, hidden=self.mlp_dim).to(self.device)
         self.ltm_map_encoder = LongTermMapEncoder(LTM_MAP_DIM, self.ltm_map_out, hidden=self.mlp_dim).to(self.device)
+        self.grid_encoder = GridEncoder(GRID_DIM, self.grid_out, hidden=self.mlp_dim).to(self.device)
 
         # --- Predictors (latent -> observation components) ---
         # Single-head reward predictors (no ensemble). Curiosity heads are already single.
@@ -650,6 +689,7 @@ class Dreamer:
         self.teamitemPredictor = TeamItemPredictor(self.concatenated_dim, self.team_dim + self.item_dim, hidden=self.mlp_dim).to(self.device)
         self.ltm_reward_predictor = LongTermMemoryPredictor(self.concatenated_dim, LTM_REWARD_DIM, hidden=self.mlp_dim).to(self.device)
         self.ltm_map_predictor = LongTermMapPredictor(self.concatenated_dim, LTM_MAP_DIM, hidden=self.mlp_dim).to(self.device)
+        self.grid_predictor = GridPredictor(self.concatenated_dim, GRID_DIM, hidden=self.mlp_dim).to(self.device)
 
         # --- Representation alignment (Barlow Twins) ---
         self.projector = nn.Linear(self.concatenated_dim, self.image_out).to(self.device)
@@ -679,7 +719,7 @@ class Dreamer:
             device=self.device, capacity=self.buffer_capacity, actionSize=self.action_dim,
             ltm_reward_dim=LTM_REWARD_DIM, ltm_map_dim=LTM_MAP_DIM,
             item_dim=self.item_dim, team_level_dim=self.team_dim,
-            num_envs=len(envs),
+            num_envs=len(envs), grid_dim=GRID_DIM,
         )
 
         # --- World-model parameter group ---
@@ -693,10 +733,12 @@ class Dreamer:
             + list(self.teamitem_encoder.parameters())
             + list(self.ltm_reward_encoder.parameters())
             + list(self.ltm_map_encoder.parameters())
+            + list(self.grid_encoder.parameters())
             + list(self.projector.parameters())
             + list(self.teamitemPredictor.parameters())
             + list(self.ltm_reward_predictor.parameters())
             + list(self.ltm_map_predictor.parameters())
+            + list(self.grid_predictor.parameters())
         )
 
         # --- Optimizers ---
@@ -730,6 +772,7 @@ class Dreamer:
         out["observations"] = out["observations"].float() / 255.0
         out["ltm_rewards"] = out["ltm_rewards"].float()
         out["ltm_maps"] = out["ltm_maps"].float()
+        out["grids"] = out["grids"].float()
         return out
 
     def computeLambdaValues(self, rewards, values, continues, lambda_=0.95):
@@ -747,7 +790,7 @@ class Dreamer:
         return bce + self.ltm_sparsity_weight * sparsity
 
     # ------------------------------------------------------
-    def _encode_components(self, obs, ltm_reward, ltm_map, team, item):
+    def _encode_components(self, obs, ltm_reward, ltm_map, grid, team, item):
         """Encode all observation components (each input already on device)."""
         teamitem = torch.cat((team / 100.0, item / 10.0), dim=-1)
         return (
@@ -755,6 +798,7 @@ class Dreamer:
             self.teamitem_encoder(teamitem),
             self.ltm_reward_encoder(ltm_reward),
             self.ltm_map_encoder(ltm_map),
+            self.grid_encoder(grid),
         )
 
     # ------------------------------------------------------
@@ -765,15 +809,17 @@ class Dreamer:
         obs_flat = batch_data["observations"].flatten(0, 1)
         ltm_reward_flat = batch_data["ltm_rewards"].flatten(0, 1)
         ltm_map_flat = batch_data["ltm_maps"].flatten(0, 1)
+        grid_flat = batch_data["grids"].flatten(0, 1)
         team_flat = batch_data["team_levels"].flatten(0, 1)
         item_flat = batch_data["item_counts"].flatten(0, 1)
 
-        enc_img, enc_teamitem, enc_ltm_reward, enc_ltm_map = self._encode_components(
-            obs_flat, ltm_reward_flat, ltm_map_flat, team_flat, item_flat)
+        enc_img, enc_teamitem, enc_ltm_reward, enc_ltm_map, enc_grid = self._encode_components(
+            obs_flat, ltm_reward_flat, ltm_map_flat, grid_flat, team_flat, item_flat)
         encoded_images = enc_img.view(B, T, -1)
         encoded_teamitem = enc_teamitem.view(B, T, -1)
         encoded_ltm_reward = enc_ltm_reward.view(B, T, -1)
         encoded_ltm_map = enc_ltm_map.view(B, T, -1)
+        encoded_grid = enc_grid.view(B, T, -1)
 
         previous_recurrent_state = torch.zeros(B, self.recurrent_dim, device=self.device)
         previous_latent_state = torch.zeros(B, self.latent_dim, device=self.device)
@@ -784,7 +830,7 @@ class Dreamer:
             prior_sample, prior_logits = self.priorNet(recurrent_state)
             posterior_input = torch.cat(
                 (recurrent_state, encoded_images[:, t], encoded_teamitem[:, t],
-                 encoded_ltm_reward[:, t], encoded_ltm_map[:, t]), dim=-1)
+                 encoded_ltm_reward[:, t], encoded_ltm_map[:, t], encoded_grid[:, t]), dim=-1)
             posterior, posterior_logits = self.posteriorNet(posterior_input)
 
             recurrent_states.append(recurrent_state)
@@ -850,6 +896,11 @@ class Dreamer:
         pred_ltm_map = self.ltm_map_predictor(full_states)
         ltm_map_loss = self._ltm_loss(pred_ltm_map, batch_data["ltm_maps"][:, 1:], self.ltm_map_pos_weight) * 50.0
 
+        # Local 3x3 explored grid reconstruction (per-cell binary). Roughly balanced
+        # (unlike the sparse LTM targets), so a plain BCE is used.
+        pred_grid = self.grid_predictor(full_states)
+        grid_loss = F.binary_cross_entropy_with_logits(pred_grid, batch_data["grids"][:, 1:]) * 50.0
+
         # KL loss.
         prior_distribution = Independent(OneHotCategoricalStraightThrough(logits=priors_logits), 1)
         prior_distribution_SG = Independent(OneHotCategoricalStraightThrough(logits=priors_logits.detach()), 1)
@@ -861,7 +912,7 @@ class Dreamer:
         kl_loss = (1 * torch.maximum(prior_loss, freeNats) + 0.1 * torch.maximum(posterior_loss, freeNats)).mean()
 
         world_model_loss = (scaled_bt_loss + kl_loss + reward_loss + teamitem_loss
-                            + ltm_reward_loss + ltm_map_loss)
+                            + ltm_reward_loss + ltm_map_loss + grid_loss)
         world_model_loss.backward()
         nn.utils.clip_grad_norm_(self.worldModelParameters, 10, norm_type=2)
         self.worldModelOptimizer.step()
@@ -915,6 +966,7 @@ class Dreamer:
                 "teamitem_loss": teamitem_loss.item(),
                 "ltm_reward_loss": ltm_reward_loss.item(),
                 "ltm_map_loss": ltm_map_loss.item(),
+                "grid_loss": grid_loss.item(),
                 "curiosity_loss": curiosity_loss.item(),
                 "sparse_curiosity_loss": sparse_curiosity_loss.item(),
                 "tile_curiosity_loss": tile_curiosity_loss.item(),
@@ -1001,10 +1053,17 @@ class Dreamer:
             map_ltm_logits = self.ltm_map_predictor(imagined_steps)        # [N, T, D]
             predicted_sparse = predicted_sparse * self._newly_activated_mask(reward_ltm_logits, self.ltm_gate_threshold)
             predicted_rewards = predicted_sparse + predicted_standard
-            # Map-transition curiosity is gated by map-memory novelty; tile curiosity
-            # is intra-map (it never flips a map bit) so it must stay UN-gated.
+            # Map-transition curiosity is gated by map-memory novelty.
             curiosity_gate = self._newly_activated_mask(map_ltm_logits, self.ltm_gate_threshold)
             sparse_curiosity = sparse_curiosity * curiosity_gate
+            # Tile curiosity is gated by the grid predictor's CENTER cell: if the
+            # imagined step lands on a tile predicted UNEXPLORED (p(explored) below
+            # threshold), the static tile bonus is paid; otherwise it is suppressed.
+            # This mirrors the LTM-gated sparse rewards but for intra-map novelty.
+            grid_logits = self.grid_predictor(imagined_steps)             # [N, T, GRID_DIM]
+            center_explored_prob = torch.sigmoid(grid_logits[..., GRID_CENTER_INDEX])
+            tile_gate = (center_explored_prob < self.grid_gate_threshold).float()
+            tile_curiosity = tile_curiosity * tile_gate
             predicted_curiosity = sparse_curiosity + tile_curiosity
 
         imagined_states = full_states.detach()
@@ -1133,11 +1192,12 @@ class Dreamer:
         latent_state = torch.zeros((num_envs, self.latent_dim), device=self.device)
         action = torch.zeros((num_envs, self.action_dim), device=self.device)
 
-        observations, ltm_rewards, ltm_maps, team_levels, item_counts = [], [], [], [], []
+        observations, ltm_rewards, ltm_maps, grids, team_levels, item_counts = [], [], [], [], [], []
         for obs, info in self.envs.reset():  # all emulators reset in parallel
             observations.append(obs)
             ltm_rewards.append(np.array(info["ltm_reward"], dtype=np.float32))
             ltm_maps.append(np.array(info["ltm_map"], dtype=np.float32))
+            grids.append(np.array(info["grid"], dtype=np.float32))
             team_levels.append(np.array(info["team_levels"], dtype=np.float32))
             item_counts.append(np.array(info["item_counts"], dtype=np.float32))
 
@@ -1145,15 +1205,16 @@ class Dreamer:
             obs_tensor = (torch.from_numpy(np.array(observations)).float() / 255.0).to(self.device)
             ltm_reward_tensor = torch.from_numpy(np.array(ltm_rewards)).float().to(self.device)
             ltm_map_tensor = torch.from_numpy(np.array(ltm_maps)).float().to(self.device)
+            grid_tensor = torch.from_numpy(np.array(grids)).float().to(self.device)
             team_tensor = torch.from_numpy(np.array(team_levels)).float().to(self.device)
             item_tensor = torch.from_numpy(np.array(item_counts)).float().to(self.device)
 
-            enc_img, enc_teamitem, enc_ltm_reward, enc_ltm_map = self._encode_components(
-                obs_tensor, ltm_reward_tensor, ltm_map_tensor, team_tensor, item_tensor)
+            enc_img, enc_teamitem, enc_ltm_reward, enc_ltm_map, enc_grid = self._encode_components(
+                obs_tensor, ltm_reward_tensor, ltm_map_tensor, grid_tensor, team_tensor, item_tensor)
 
             recurrent_state = self.recurrentModel(recurrent_state, latent_state, action)
             posterior_input = torch.cat((recurrent_state, enc_img, enc_teamitem,
-                                         enc_ltm_reward, enc_ltm_map), -1)
+                                         enc_ltm_reward, enc_ltm_map, enc_grid), -1)
             latent_state, _ = self.posteriorNet(posterior_input)
             action_onehot, _, _ = self.actor(torch.cat((recurrent_state, latent_state), -1))
 
@@ -1189,13 +1250,14 @@ class Dreamer:
 
                 local_buffers[i].append((
                     observations[i].copy(), ltm_rewards[i].copy(), ltm_maps[i].copy(),
-                    item_counts[i].copy(), team_levels[i].copy(),
+                    grids[i].copy(), item_counts[i].copy(), team_levels[i].copy(),
                     actions_for_buffer[i].copy(), sparse_reward, standard_reward,
                     sparse_curiosity, tile_curiosity))
 
                 observations[i] = next_observation
                 ltm_rewards[i] = np.array(next_info["ltm_reward"], dtype=np.float32)
                 ltm_maps[i] = np.array(next_info["ltm_map"], dtype=np.float32)
+                grids[i] = np.array(next_info["grid"], dtype=np.float32)
                 team_levels[i] = np.array(next_info["team_levels"], dtype=np.float32)
                 item_counts[i] = np.array(next_info["item_counts"], dtype=np.float32)
 
@@ -1226,6 +1288,7 @@ class Dreamer:
                 observations[i] = next_obs
                 ltm_rewards[i] = np.array(next_info["ltm_reward"], dtype=np.float32)
                 ltm_maps[i] = np.array(next_info["ltm_map"], dtype=np.float32)
+                grids[i] = np.array(next_info["grid"], dtype=np.float32)
                 team_levels[i] = np.array(next_info["team_levels"], dtype=np.float32)
                 item_counts[i] = np.array(next_info["item_counts"], dtype=np.float32)
 
@@ -1243,8 +1306,8 @@ class Dreamer:
     # ------------------------------------------------------
     _CHECKPOINT_MODULES = [
         'recurrentModel', 'posteriorNet', 'priorNet', 'sparseRewardPredictor', 'standardRewardPredictor',  # 'curiosityPredictor',  # fresh init: switched to symlog two-hot
-        'image_encoder', 'teamitem_encoder', 'ltm_reward_encoder', 'ltm_map_encoder',
-        'teamitemPredictor', 'ltm_reward_predictor', 'ltm_map_predictor', 'projector',
+        'image_encoder', 'teamitem_encoder', 'ltm_reward_encoder', 'ltm_map_encoder', 'grid_encoder',
+        'teamitemPredictor', 'ltm_reward_predictor', 'ltm_map_predictor', 'grid_predictor', 'projector',
         'actor', 'critic', 'ema_critic', 'curiosity_critic', 'ema_curiosity_critic',
         'dynamicDataNormalizer', 'curiosityDynamicDataNormalizer', 'decoder',
     ]
@@ -1321,11 +1384,15 @@ class Dreamer:
                                pdf=None):
         best_states_device = best_states.to(self.device)
 
-        # Predicted curiosity per imagined state = map-transition head + tile head,
-        # the same sum the dream optimizes (predicted_curiosity in Dream()).
+        # Predicted curiosity per imagined state = map-transition head + grid-gated
+        # tile head, matching the sum the dream optimizes (predicted_curiosity in
+        # Dream()). The tile bonus is gated by the grid predictor's center cell.
+        grid_logits = self.grid_predictor(best_states_device)
+        center_explored_prob = torch.sigmoid(grid_logits[..., GRID_CENTER_INDEX])
+        tile_gate = (center_explored_prob < self.grid_gate_threshold).float()
         curiosities = (
             self.two_hot.decode(self.curiosityPredictor(best_states_device)).squeeze(-1)
-            + self.two_hot.decode(self.tileCuriosityPredictor(best_states_device)).squeeze(-1)
+            + self.two_hot.decode(self.tileCuriosityPredictor(best_states_device)).squeeze(-1) * tile_gate
         ).cpu()
 
         decoded_imgs = self.decoder(best_states_device).clamp(0.0, 1.0).cpu()  # [horizon, 3, 64, 64]
