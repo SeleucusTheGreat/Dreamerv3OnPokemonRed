@@ -17,8 +17,8 @@ class Policy(nn.Module):
         self.envs = envs
         self.action_dim = envs.action_space.n
         self.buffer_size = 1000000
-        self.mlp_dim = 756       # MLP width for all dense models (configurable)
-        self.recurrent_dim = 2048
+        self.mlp_dim = 1024       # MLP width for all dense models (configurable)
+        self.recurrent_dim = 4096  # LSTM width for recurrent model (configurable)
         self.rows = 40
         self.cols = 40
         self.latent_dim = self.rows * self.cols
@@ -27,8 +27,8 @@ class Policy(nn.Module):
         self.seed = 42
         self.number_of_sequences = 64 # Batch size
         self.steps_per_sequence = 64
-        self.curiosity_scale = 0.20
-        self.checkpoint_interval = 2 # Save every N episodes
+        self.curiosity_scale = 0.25
+        self.checkpoint_interval = 3 # Save every N episodes
         
         self.visualize_dreams = visualize_dreams
         self.seedMeDaddy(self.seed)

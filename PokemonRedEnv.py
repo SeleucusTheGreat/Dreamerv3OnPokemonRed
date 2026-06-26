@@ -213,14 +213,11 @@ class PokemonRedEnv(gym.Env):
 
         self.visited_maps = set()
 
-        # Whole-game long-term event memory: snapshot of the start-state event bits, used
         # to mask out flags that were already set so the LTM vector reflects *new* progress.
         self.start_event_bits = np.zeros(NUM_EVENT_BITS, dtype=np.float32)
         self.last_event_bits = np.zeros(NUM_EVENT_BITS, dtype=np.float32)
 
         # Reward-eligibility mask: zero out the prologue region (idx 0..109, up to GOT_POKEDEX)
-        # and any explicitly ignored noisy flags, so neither the event reward nor the LTM
-        # reward vector ever pays for prologue/noise flags.
         self.reward_keep_mask = np.ones(NUM_EVENT_BITS, dtype=np.float32)
         self.reward_keep_mask[:PROLOGUE_LTM_END] = 0.0
         for idx in IGNORED_EVENT_INDICES:
@@ -236,11 +233,11 @@ class PokemonRedEnv(gym.Env):
         self.pyboy.set_emulation_speed(speed) # 0 = Unlimited speed for training
         
         # Budget Constants
-        self.init_steps = 20000
+        self.init_steps = 15000
 
 
         # --- REWARDS CONSTANTS ---
-        self.step_increase = 2000
+        self.step_increase = 2500
         self.reward_event_val = 50   
         self.reward_heal_mult = 2.5
         self.reward_lvl_mult = 5
@@ -391,25 +388,14 @@ class PokemonRedEnv(gym.Env):
         brock_before = self.brock_defeated
         self._apply_action(action)
         self.current_step += 1
-        # Reward is split into two streams that are summed for the env return:
-        #   sparse_reward   -> memory-tied events (event flags, Brock, first pokeball).
-        #                      These correspond to changes in the LTM reward memory and
-        #                      are the ones gated by the LTM predictor during the dream.
-        #   standard_reward -> non-memory events (healing, level-ups).
         sparse_reward = 0.000
         standard_reward = 0.000
-
-        # Verbose reward/curiosity messages are COLLECTED here and shipped back to
-        # the parent process in info["logs"]. Under parallel (subprocess) env
-        # training, prints inside this worker process are not captured by the
-        # notebook/console, so the main process prints these instead.
         logs = []
 
         coord = self._get_current_position()
         map_id, x, y = coord
         
-        # --- Map-transition curiosity: +MAP_CURIOSITY_BONUS the first time
-        # each monitored map is entered this episode, 0 otherwise. ---
+        # --- MAP_CURIOSITY_BONUS ---
         sparse_curiosity = 0.0
         if map_id in MONITORED_MAPS_SET and map_id not in self.curiosity_triggered_maps:
             sparse_curiosity = MAP_CURIOSITY_BONUS
@@ -418,15 +404,8 @@ class PokemonRedEnv(gym.Env):
                 map_name = MAP_NAMES.get(map_id, f"Map ID {map_id}")
                 logs.append(f"[CURIOSITY BONUS] +{MAP_CURIOSITY_BONUS} awarded for transitioning to {map_name}")
 
-        # --- Local exploration grid: read BEFORE marking the current tile, so the
-        # center cell is 0 exactly on the step the agent enters a brand-new tile.
-        # This is the signal the grid predictor's center-cell gate localises. ---
+        # --- TILE_CURIOSITY_BONUS ---
         explored_grid = self._get_explored_grid(coord)
-
-        # --- Tile curiosity: dense, STATIC bonus the first time each (map, x, y)
-        # tile is visited this episode. Kept separate from the map-transition
-        # bonus so the dream credits it via the grid (center-cell) gate rather
-        # than the map-novelty gate (intra-map tiles never flip a map bit). ---
         tile_curiosity = 0.0
         if coord not in self.episode_visited_tiles:
             self.episode_visited_tiles.add(coord)
@@ -434,7 +413,7 @@ class PokemonRedEnv(gym.Env):
 
         self.visited_maps.add(map_id)
 
-        # EVENT REWARD: +reward_event_val per newly-set, reward-eligible (post-prologue) flag.
+        # --- EVENT REWARD ---
         current_event_bits = self._get_new_event_bits()
         current_events = int(current_event_bits.sum())
 
@@ -462,9 +441,6 @@ class PokemonRedEnv(gym.Env):
         brock_after = (self.pyboy.memory[0xD356] & 1) == 1
         if not brock_before and brock_after:
             self.brock_defeated = True
-            # Beating Brock should yield +200 rather than the normal +50.
-            # Since the event reward gain already added +50 (or will add +50),
-            # we add +50 to make the total +200.
             sparse_reward += 50.0
             if self.verbose:
                 logs.append("[BROCK DEFEAT] +50.0 added (total 100.0 for beating Brock)")
@@ -472,6 +448,8 @@ class PokemonRedEnv(gym.Env):
         # PARTY HEALING REWARD
         total_level, hp_fraction_sum, party_count = self._get_party_info()
 
+
+        # --- HEALING REWARD ---
         if hp_fraction_sum > self.last_hp_fraction_sum and party_count == self.last_party_count:
             if self.last_hp_fraction_sum > 0.0:  # Avoid healing reward on respawn
                 heal_gain = hp_fraction_sum - self.last_hp_fraction_sum
@@ -483,7 +461,7 @@ class PokemonRedEnv(gym.Env):
         self.last_hp_fraction_sum = hp_fraction_sum
         self.last_party_count = party_count
 
-        # LEVEL UP REWARD 
+        # --- LEVEL UP REWARD ---
         current_lvl_val = self._calculate_level_reward(total_level)
         if current_lvl_val > self.max_level_reward:
             lvl_gain = current_lvl_val - self.max_level_reward
@@ -498,7 +476,7 @@ class PokemonRedEnv(gym.Env):
             if self.verbose:
                 logs.append(f"[LEVEL] +{decayed_lvl_gain:.3f} | Total Party Level up to: {total_level}")
 
-        # ITEM REWARD
+        # --- ITEM REWARD ---
         if not self.has_obtained_pokeball:
             if self._has_pokeball():
                 self.has_obtained_pokeball = True

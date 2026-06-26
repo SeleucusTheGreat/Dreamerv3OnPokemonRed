@@ -28,23 +28,6 @@ def symexp(x):
     return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
 
 
-def _straight_through_sample(probabilities):
-    """Hard one-hot categorical sample with a straight-through gradient.
-
-    Replaces per-timestep Independent(OneHotCategoricalStraightThrough(...)).rsample()
-    in the RSSM loop to avoid distribution-object construction overhead. `probabilities`
-    is [N, rows, cols] and already normalised over the last dim. Returns [N, rows, cols]:
-    a hard one-hot in the forward pass, with gradients flowing through `probabilities`
-    exactly as OneHotCategoricalStraightThrough does.
-    """
-    N, rows, cols = probabilities.shape
-    flat = probabilities.reshape(N * rows, cols)
-    idx = torch.multinomial(flat, 1).squeeze(-1)
-    hard = F.one_hot(idx, cols).to(probabilities.dtype).view(N, rows, cols)
-    # Straight-through: forward = hard one-hot, backward = grad w.r.t. probabilities.
-    return hard + (probabilities - probabilities.detach())
-
-
 def _mlp2(in_dim, out_dim, hidden=1024, act=nn.ELU, norm_out=True):
     """Two-layer MLP (one hidden layer). `hidden` controls the MLP width."""
     layers = [nn.Linear(in_dim, hidden), nn.LayerNorm(hidden), act(), nn.Linear(hidden, out_dim)]
@@ -334,7 +317,7 @@ class PriorNet(nn.Module):
         confusion = torch.ones_like(rawProbabilities) / self.cols
         probabilities = 0.99 * rawProbabilities + 0.01 * confusion
         logits = probs_to_logits(probabilities)
-        sample = _straight_through_sample(probabilities).view(-1, self.latentSize)
+        sample = Independent(OneHotCategoricalStraightThrough(probs=probabilities), 1).rsample().view(-1, self.latentSize)
         return sample, logits
 
 
@@ -353,7 +336,7 @@ class PosteriorNet(nn.Module):
         confusion = torch.ones_like(rawProbabilities) / self.cols
         probabilities = 0.99 * rawProbabilities + 0.01 * confusion
         logits = probs_to_logits(probabilities)
-        sample = _straight_through_sample(probabilities).view(-1, self.rows * self.cols)
+        sample = Independent(OneHotCategoricalStraightThrough(probs=probabilities), 1).rsample().view(-1, self.rows * self.cols)
         return sample, logits
 
 
@@ -484,10 +467,6 @@ class Buffer(object):
             sample_indices.append((all_starts + seq_offsets) % self.capacity)
 
         sampleIndex = torch.cat(sample_indices, dim=0).long()
-        # Gather on CPU only (the expensive part) and pin the result so the H2D copy
-        # in Dreamer._batch_to_device can be async (non_blocking) and overlap GPU
-        # compute. dtype conversions (uint8->float, /255) are done GPU-side after the
-        # transfer. The CPU gather here is what the BatchPrefetcher runs off-thread.
         batch = {
             "observations":       self.observations[sampleIndex],   # uint8
             "ltm_rewards":        self.ltm_rewards[sampleIndex],     # uint8
@@ -626,9 +605,9 @@ class Dreamer:
 
         # Auxiliary feature sizes feeding the posterior.
         self.image_out = 1024
-        self.teamitem_out = 256
+        self.teamitem_out = 128
         self.ltm_reward_out = 512
-        self.ltm_map_out = 512
+        self.ltm_map_out = 256
         self.grid_out = 128
         self.team_dim = team_dim
         self.item_dim = item_dim
@@ -636,7 +615,7 @@ class Dreamer:
                                      + self.ltm_reward_out + self.ltm_map_out
                                      + self.grid_out)
 
-        self.entropy_scale = 0.002
+        self.entropy_scale = 0.001
         self.number_of_sequences = number_of_sequences
         self.steps_per_sequence = steps_per_sequence
         self.buffer_capacity = buffer_size
@@ -648,18 +627,16 @@ class Dreamer:
 
         # Whole-game LTM loss shaping (sparse multi-label targets).
         self.ltm_reward_pos_weight = torch.tensor(200.0, device=self.device)
-        self.ltm_map_pos_weight = torch.tensor(5.0, device=self.device)
+        self.ltm_map_pos_weight = torch.tensor(100.0, device=self.device)
         self.ltm_sparsity_weight = 0.5
 
         # Exploration: fraction of dream starts resampled from high-novelty states.
-        self.dream_priority_fraction = 0.05
-        self.dream_reward_priority_fraction = 0.05
+        self.dream_priority_fraction = 0.1
+        self.dream_reward_priority_fraction = 0.1
 
         # Dream sparse-reward curiosity gating
         self.ltm_gate_threshold = 0.3
-        # Dream tile-curiosity gating: the grid predictor's center cell must read
-        # as UNEXPLORED (predicted p(explored) < threshold) for the imagined step
-        # to be credited the static tile bonus.
+        # Dream tile-curiosity gating
         self.grid_gate_threshold = 0.5
 
         # --- Encodings ---
@@ -984,7 +961,7 @@ class Dreamer:
         newly_on = on & (prev_on < 0.5)                                # on now, never on before
         return newly_on.any(dim=-1).float()                            # [N, T]
 
-    def Dream(self, full_state, batch_data=None, horizon=20, dream_priorities=None, compute_metrics=True):
+    def Dream(self, full_state, batch_data=None, horizon=15, dream_priorities=None, compute_metrics=True):
         self.actorOptimizer.zero_grad(set_to_none=True)
         self.criticOptimizer.zero_grad(set_to_none=True)
         self.curiosityCriticOptimizer.zero_grad(set_to_none=True)
@@ -1091,20 +1068,7 @@ class Dreamer:
             ema_probs * (torch.log_softmax(ema_critic_logits, dim=-1) - torch.log_softmax(critic_logits_to_train, dim=-1)), dim=-1))
         critic_loss = critic_loss_main + critic_ema_reg
 
-        # --- Critic replay loss (repval, DreamerV3) — REWARD CRITIC ONLY ---
-        # Grounds the reward critic on REAL replay rewards rather than only on
-        # imagined rollouts (where the actor can climb a self-made value ramp).
-        # We compute lambda-returns over the real buffer rewards using the
-        # current critic's values on the real replayed states as on-policy value
-        # annotations, then regress the critic toward them at beta=0.3 (paper's
-        # scale). The real reward events anchor the scale, and on zero-reward
-        # segments the detached-value bootstrap with gamma<1 contracts toward 0,
-        # which is the grounding the imagination-only loss lacks.
-        # NOTE: the paper uses the imagined returns Rlambda at the rollout start
-        # states as the annotations; here we use the detached online critic value
-        # (the standard, cheaper TD(lambda)-on-replay equivalent) because the
-        # imagination rollout above is run on prioritization-reshuffled starts
-        # and no longer aligns to the [B, T-1] replay grid.
+        # --- Critic Grounding — REWARD CRITIC ONLY ---
         repval_loss = torch.zeros((), device=self.device)
         if batch_data is not None and "standard_rewards" in batch_data:
             B = self.number_of_sequences
@@ -1330,7 +1294,7 @@ class Dreamer:
         return avg_score, avg_curiosity
 
     # ------------------------------------------------------
-    # CHECKPOINTING (clean dict-based save/load with graceful fallback)
+    # CHECKPOINTING 
     # ------------------------------------------------------
     _CHECKPOINT_MODULES = [
         'recurrentModel', 'posteriorNet', 'priorNet', 'sparseRewardPredictor', 'standardRewardPredictor',  # 'curiosityPredictor',  # fresh init: switched to symlog two-hot
