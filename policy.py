@@ -28,7 +28,8 @@ class Policy(nn.Module):
         self.number_of_sequences = 64 # Batch size
         self.steps_per_sequence = 64
         self.curiosity_scale = 0.25
-        self.checkpoint_interval = 3 # Save every N episodes
+        self.reward_sample_fraction = 0.03  # fraction of each batch guaranteed to cover a sparse-reward step
+        self.checkpoint_interval = 2 # Save every N episodes
         
         self.visualize_dreams = visualize_dreams
         self.seedMeDaddy(self.seed)
@@ -49,7 +50,8 @@ class Policy(nn.Module):
             team_dim=6,
             item_dim=2,
             curiosity_scale=self.curiosity_scale,
-            mlp_dim=self.mlp_dim
+            mlp_dim=self.mlp_dim,
+            reward_sample_fraction=self.reward_sample_fraction,
         )
 
     def train(self):
