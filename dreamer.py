@@ -631,8 +631,8 @@ class Dreamer:
         self.ltm_sparsity_weight = 0.5
 
         # Exploration: fraction of dream starts resampled from high-novelty states.
-        self.dream_priority_fraction = 0.1
-        self.dream_reward_priority_fraction = 0.1
+        self.dream_priority_fraction = 0.05
+        self.dream_reward_priority_fraction = 0.05
 
         # Dream sparse-reward curiosity gating
         self.ltm_gate_threshold = 0.3
@@ -863,11 +863,11 @@ class Dreamer:
 
         # Whole-game long-term reward memory (sparse multi-label).
         pred_ltm_reward = self.ltm_reward_predictor(full_states)
-        ltm_reward_loss = self._ltm_loss(pred_ltm_reward, batch_data["ltm_rewards"][:, 1:], self.ltm_reward_pos_weight) * 50.0
+        ltm_reward_loss = self._ltm_loss(pred_ltm_reward, batch_data["ltm_rewards"][:, 1:], self.ltm_reward_pos_weight) * 100.0
 
         # Whole-game long-term map memory (sparse multi-label).
         pred_ltm_map = self.ltm_map_predictor(full_states)
-        ltm_map_loss = self._ltm_loss(pred_ltm_map, batch_data["ltm_maps"][:, 1:], self.ltm_map_pos_weight) * 50.0
+        ltm_map_loss = self._ltm_loss(pred_ltm_map, batch_data["ltm_maps"][:, 1:], self.ltm_map_pos_weight) * 100.0
 
         # Local 3x3 explored grid reconstruction (per-cell binary). Roughly balanced
         # (unlike the sparse LTM targets), so a plain BCE is used.
