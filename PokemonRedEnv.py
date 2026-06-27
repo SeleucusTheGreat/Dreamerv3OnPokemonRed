@@ -443,7 +443,14 @@ class PokemonRedEnv(gym.Env):
             self.brock_defeated = True
             sparse_reward += 50.0
             if self.verbose:
-                logs.append("[BROCK DEFEAT] +50.0 added (total 100.0 for beating Brock)")
+                # Bright, hard-to-miss banner (bold bright-yellow on magenta).
+                _bar = "\033[1;97;45m" + "=" * 64 + "\033[0m"
+                _msg = "\033[1;93;45m" + "  ★★★  BROCK DEFEATED!  +50.0  (total 100.0)  ★★★  ".center(64) + "\033[0m"
+                logs.append("")
+                logs.append(_bar)
+                logs.append(_msg)
+                logs.append(_bar)
+                logs.append("")
 
         # PARTY HEALING REWARD
         total_level, hp_fraction_sum, party_count = self._get_party_info()

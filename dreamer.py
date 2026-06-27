@@ -401,7 +401,8 @@ class Buffer(object):
     def __init__(self, device, capacity=800000, actionSize=6,
                  ltm_reward_dim=LTM_REWARD_DIM, ltm_map_dim=LTM_MAP_DIM,
                  item_dim=2, team_level_dim=6, num_envs=4, grid_dim=GRID_DIM,
-                 reward_sample_fraction=0.10):
+                 reward_sample_fraction=0.10, curiosity_sample_fraction=0.10,
+                 recent_sample_fraction=0.20):
         self.device = device
         self.capacity = capacity
         self.num_envs = num_envs
@@ -421,18 +422,22 @@ class Buffer(object):
         self.index = 0
         self.full = False
 
-        # Reward-aware sampling: positions (ring-buffer slots) whose sparse_reward > 0.
-        # Maintained incrementally in add(); used by sample() to guarantee a fraction
-        # of every batch covers a real sparse-reward step instead of relying on those
-        # rare transitions randomly turning up in a uniform draw.
+        # Bias-aware sampling: positions (ring-buffer slots) whose sparse_reward > 0
+        # or sparse_curiosity > 0. Maintained incrementally in add(); used by sample()
+        # to guarantee a fraction of every batch covers those rare transitions instead
+        # of relying on them randomly turning up in a uniform draw.
         self._reward_positions = set()
+        self._curiosity_positions = set()
         self.reward_sample_fraction = reward_sample_fraction
+        self.curiosity_sample_fraction = curiosity_sample_fraction
+        self.recent_sample_fraction = recent_sample_fraction
 
     def add(self, observation, ltm_reward, ltm_map, grid, item_count, team_level, action,
             sparse_reward, standard_reward, sparse_curiosity, tile_curiosity):
         # The slot we are about to overwrite loses whatever it held; drop any stale
-        # reward marker there before writing the new transition.
+        # markers there before writing the new transition.
         self._reward_positions.discard(self.index)
+        self._curiosity_positions.discard(self.index)
         self.observations[self.index] = torch.as_tensor(observation, dtype=torch.uint8)
         self.ltm_rewards[self.index] = torch.as_tensor(ltm_reward, dtype=torch.uint8)
         self.ltm_maps[self.index] = torch.as_tensor(ltm_map, dtype=torch.uint8)
@@ -447,20 +452,38 @@ class Buffer(object):
 
         if float(sparse_reward) > 0.0:
             self._reward_positions.add(self.index)
+        if float(sparse_curiosity) > 0.0:
+            self._curiosity_positions.add(self.index)
 
         self.index = (self.index + 1) % self.capacity
         self.full = self.full or (self.index == 0)
+
+    def _sequences_covering(self, positions, num, sequenceSize):
+        """Build `num` sequence-index rows, each guaranteed to contain one of the given
+        ring-buffer `positions`, placed at a random offset inside the sequence so there
+        is lead-in context before it. Full buffer wraps; not-full clamps into valid
+        contiguous data (the position stays inside the window after clamping)."""
+        pos = torch.tensor(sorted(positions), dtype=torch.long)
+        pick = pos[torch.randint(0, pos.numel(), (num, 1))]
+        in_seq = torch.randint(0, sequenceSize, (num, 1))
+        if self.full:
+            starts = (pick - in_seq) % self.capacity
+        else:
+            starts = torch.clamp(pick - in_seq, 0, self.index - sequenceSize)
+        seq_offsets = torch.arange(sequenceSize).reshape(1, -1)
+        return (starts + seq_offsets) % self.capacity
 
     def sample(self, batchSize, sequenceSize):
         N = self.capacity if self.full else self.index
         if N < sequenceSize:
             return None
 
-        num_recent = int(round(batchSize * 0.20))
+        num_recent = int(round(batchSize * self.recent_sample_fraction))
         num_all = batchSize - num_recent
         sample_indices = []
 
-        # 25% from a recent window, 75% uniformly across the whole buffer.
+        # `recent_sample_fraction` of the batch comes from a recent window, the
+        # remainder uniformly across the whole buffer.
         if num_recent > 0:
             effective_window = min(20000 * self.num_envs, N)
             max_offset = effective_window - sequenceSize
@@ -472,25 +495,20 @@ class Buffer(object):
             else:
                 num_all += num_recent
 
-        # Reward-aware injection: force a fraction of the batch to be sequences that
-        # actually contain a known sparse-reward step. These slots are taken from the
-        # uniform pool so the total batch size is unchanged. Each reward step is placed
-        # at a random offset inside its sequence, leaving lead-in context before it.
+        # Bias-aware injection: force a fraction of the batch to be sequences that
         if self._reward_positions and self.reward_sample_fraction > 0.0:
             num_reward = min(int(round(batchSize * self.reward_sample_fraction)), num_all)
             if num_reward > 0:
                 num_all -= num_reward
-                reward_pos = torch.tensor(sorted(self._reward_positions), dtype=torch.long)
-                pick = reward_pos[torch.randint(0, reward_pos.numel(), (num_reward, 1))]
-                in_seq = torch.randint(0, sequenceSize, (num_reward, 1))
-                if self.full:
-                    reward_starts = (pick - in_seq) % self.capacity
-                else:
-                    # Not full: clamp into valid contiguous data. With offset < seq the
-                    # reward step stays inside the sequence after clamping at either end.
-                    reward_starts = torch.clamp(pick - in_seq, 0, self.index - sequenceSize)
-                seq_offsets = torch.arange(sequenceSize).reshape(1, -1)
-                sample_indices.append((reward_starts + seq_offsets) % self.capacity)
+                sample_indices.append(
+                    self._sequences_covering(self._reward_positions, num_reward, sequenceSize))
+
+        if self._curiosity_positions and self.curiosity_sample_fraction > 0.0:
+            num_curiosity = min(int(round(batchSize * self.curiosity_sample_fraction)), num_all)
+            if num_curiosity > 0:
+                num_all -= num_curiosity
+                sample_indices.append(
+                    self._sequences_covering(self._curiosity_positions, num_curiosity, sequenceSize))
 
         if num_all > 0:
             limit = self.capacity if self.full else (self.index - sequenceSize + 1)
@@ -555,12 +573,15 @@ class Buffer(object):
                 print(f"[*] Buffer field '{name}' absent in checkpoint; leaving zeros.")
         self.index = n % self.capacity
         self.full = (n == self.capacity)
-        # Rebuild the reward-position index from the restored data so reward-aware
-        # sampling keeps working across checkpoint reloads.
+        # Rebuild the bias-position indices from the restored data so reward- and
+        # curiosity-aware sampling keep working across checkpoint reloads.
         reward_slots = (self.sparse_rewards[:n].squeeze(-1) > 0.0).nonzero(as_tuple=False).flatten()
         self._reward_positions = set(reward_slots.tolist())
+        curiosity_slots = (self.sparse_curiosities[:n].squeeze(-1) > 0.0).nonzero(as_tuple=False).flatten()
+        self._curiosity_positions = set(curiosity_slots.tolist())
         print(f"[*] Loaded buffer with {n} transitions (full={self.full}, write_head={self.index}, "
-              f"reward_positions={len(self._reward_positions)})")
+              f"reward_positions={len(self._reward_positions)}, "
+              f"curiosity_positions={len(self._curiosity_positions)})")
 
     def print_diagnostics(self):
         valid = self.capacity if self.full else self.index
@@ -628,7 +649,12 @@ class Dreamer:
                  action_dim=6, recurrent_dim=512, rows=64, cols=64, latent_dim=256,
                  number_of_sequences=32, steps_per_sequence=64, seed=42, buffer_size=10000,
                  team_dim=6, item_dim=2, curiosity_scale=0.05, mlp_dim=1024,
-                 reward_sample_fraction=0.10):
+                 reward_sample_fraction=0.10, curiosity_sample_fraction=0.10,
+                 entropy_scale=0.002, recent_sample_fraction=0.20,
+                 teamitem_out=128, ltm_reward_out=512, ltm_map_out=256, grid_out=128,
+                 dream_priority_fraction=0.05, dream_reward_priority_fraction=0.05,
+                 dream_lead_steps=10, ltm_gate_threshold=0.3, grid_gate_threshold=0.5,
+                 critic_ema_decay=0.98, curiosity_critic_ema_decay=0.90):
 
         # --- Dimensions / config ---
         self.device = device
@@ -645,22 +671,23 @@ class Dreamer:
 
         # Auxiliary feature sizes feeding the posterior.
         self.image_out = 1024
-        self.teamitem_out = 128
-        self.ltm_reward_out = 512
-        self.ltm_map_out = 256
-        self.grid_out = 128
+        self.teamitem_out = teamitem_out
+        self.ltm_reward_out = ltm_reward_out
+        self.ltm_map_out = ltm_map_out
+        self.grid_out = grid_out
         self.team_dim = team_dim
         self.item_dim = item_dim
         self.enconder_output_size = (self.image_out + self.teamitem_out
                                      + self.ltm_reward_out + self.ltm_map_out
                                      + self.grid_out)
 
-        self.entropy_scale = 0.0015
+        self.entropy_scale = entropy_scale
         self.number_of_sequences = number_of_sequences
         self.steps_per_sequence = steps_per_sequence
         self.buffer_capacity = buffer_size
-        # Fraction of each sampled batch guaranteed to cover a known sparse-reward step.
         self.reward_sample_fraction = reward_sample_fraction
+        self.curiosity_sample_fraction = curiosity_sample_fraction
+        self.recent_sample_fraction = recent_sample_fraction
         self.curiosity_scale = curiosity_scale
         self.envs = envs
 
@@ -673,17 +700,14 @@ class Dreamer:
         self.ltm_sparsity_weight = 0.5
 
         # Exploration: fraction of dream starts resampled from high-novelty states.
-        self.dream_priority_fraction = 0.05
-        self.dream_reward_priority_fraction = 0.05
-        # Rewind prioritized dream starts this many steps WITHIN their own sequence
-        # so the imagination begins BEFORE the prioritized event and has room to
-        # roll into the off->on LTM transition (clamped at the sequence start).
-        self.dream_lead_steps = 10
+        self.dream_priority_fraction = dream_priority_fraction
+        self.dream_reward_priority_fraction = dream_reward_priority_fraction
+        self.dream_lead_steps = dream_lead_steps
 
         # Dream sparse-reward curiosity gating
-        self.ltm_gate_threshold = 0.3
+        self.ltm_gate_threshold = ltm_gate_threshold
         # Dream tile-curiosity gating
-        self.grid_gate_threshold = 0.5
+        self.grid_gate_threshold = grid_gate_threshold
 
         # --- Encodings ---
         self.two_hot = TwoHotEncoding(device=self.device)
@@ -730,8 +754,8 @@ class Dreamer:
         for p in self.ema_curiosity_critic.parameters():
             p.requires_grad = False
 
-        self.critic_ema_decay = 0.98
-        self.curiosity_critic_ema_decay = 0.90
+        self.critic_ema_decay = critic_ema_decay
+        self.curiosity_critic_ema_decay = curiosity_critic_ema_decay
 
         # --- Buffer ---
         self.buffer = Buffer(
@@ -740,6 +764,8 @@ class Dreamer:
             item_dim=self.item_dim, team_level_dim=self.team_dim,
             num_envs=len(envs), grid_dim=GRID_DIM,
             reward_sample_fraction=self.reward_sample_fraction,
+            curiosity_sample_fraction=self.curiosity_sample_fraction,
+            recent_sample_fraction=self.recent_sample_fraction,
         )
 
         # --- World-model parameter group ---
@@ -768,8 +794,6 @@ class Dreamer:
         self.curiosityCriticOptimizer = torch.optim.Adam(self.curiosity_critic.parameters(), lr=1e-4)
         self.curiosityHeadOptimizer = torch.optim.Adam(
             self.curiosityPredictor.parameters(), lr=1e-4)
-        # Separate optimizer for the tile head (kept out of the checkpoint lists,
-        # fresh-init like curiosityPredictor, so existing checkpoints still load).
         self.tileCuriosityHeadOptimizer = torch.optim.Adam(
             self.tileCuriosityPredictor.parameters(), lr=1e-4)
 
@@ -1149,7 +1173,7 @@ class Dreamer:
                 replay_logits = self.critic(real_states[:, :-1])                        # [B, Tr-1, bins]
                 repval_loss = -torch.mean(torch.sum(
                     replay_target_two_hot * torch.log_softmax(replay_logits, dim=-1), dim=-1))
-        critic_loss = critic_loss + 0.3 * repval_loss
+        critic_loss = critic_loss + 0.5 * repval_loss
 
         # --- Curiosity critic loss (CE to lambda returns + EMA KL anchor) ---
         curiosity_critic_logits_to_train = self.curiosity_critic(imagined_states)[:, :-1]

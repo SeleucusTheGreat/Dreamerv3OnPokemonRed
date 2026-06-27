@@ -19,6 +19,10 @@ class Policy(nn.Module):
         self.buffer_size = 1000000
         self.mlp_dim = 1024       # MLP width for all dense models (configurable)
         self.recurrent_dim = 4096  # LSTM width for recurrent model (configurable)
+        self.teamitem_out = 128
+        self.ltm_reward_out = 512
+        self.ltm_map_out = 256
+        self.grid_out = 128
         self.rows = 40
         self.cols = 40
         self.latent_dim = self.rows * self.cols
@@ -29,7 +33,17 @@ class Policy(nn.Module):
         self.steps_per_sequence = 64
         self.curiosity_scale = 0.25
         self.reward_sample_fraction = 0.03  # fraction of each batch guaranteed to cover a sparse-reward step
+        self.curiosity_sample_fraction = 0.02  # fraction of each batch guaranteed to cover a sparse-curiosity step
         self.checkpoint_interval = 2 # Save every N episodes
+        self.entropy_scale = 0.0015              # actor entropy bonus weight
+        self.recent_sample_fraction = 0.40      # fraction of each batch drawn from the recent-experience window
+        self.dream_priority_fraction = 0.05         # dream starts resampled by map-novelty
+        self.dream_reward_priority_fraction = 0.05  # dream starts resampled by sparse reward
+        self.dream_lead_steps = 10                  # rewind prioritized starts this many steps
+        self.ltm_gate_threshold = 0.4
+        self.grid_gate_threshold = 0.5
+        self.critic_ema_decay = 0.98
+        self.curiosity_critic_ema_decay = 0.90
         
         self.visualize_dreams = visualize_dreams
         self.seedMeDaddy(self.seed)
@@ -52,6 +66,20 @@ class Policy(nn.Module):
             curiosity_scale=self.curiosity_scale,
             mlp_dim=self.mlp_dim,
             reward_sample_fraction=self.reward_sample_fraction,
+            curiosity_sample_fraction=self.curiosity_sample_fraction,
+            entropy_scale=self.entropy_scale,
+            recent_sample_fraction=self.recent_sample_fraction,
+            teamitem_out=self.teamitem_out,
+            ltm_reward_out=self.ltm_reward_out,
+            ltm_map_out=self.ltm_map_out,
+            grid_out=self.grid_out,
+            dream_priority_fraction=self.dream_priority_fraction,
+            dream_reward_priority_fraction=self.dream_reward_priority_fraction,
+            dream_lead_steps=self.dream_lead_steps,
+            ltm_gate_threshold=self.ltm_gate_threshold,
+            grid_gate_threshold=self.grid_gate_threshold,
+            critic_ema_decay=self.critic_ema_decay,
+            curiosity_critic_ema_decay=self.curiosity_critic_ema_decay,
         )
 
     def train(self):
