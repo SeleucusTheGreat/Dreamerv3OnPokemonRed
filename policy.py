@@ -29,17 +29,19 @@ class Policy(nn.Module):
         self.total_num_episodes = 10000
         self.training_per_episodes = 500
         self.seed = 42
-        self.number_of_sequences = 64 # Batch size
+        self.number_of_sequences = 40 # Batch size
         self.steps_per_sequence = 64
-        self.curiosity_scale = 0.25
-        self.reward_sample_fraction = 0.03  # fraction of each batch guaranteed to cover a sparse-reward step
-        self.curiosity_sample_fraction = 0.02  # fraction of each batch guaranteed to cover a sparse-curiosity step
+        self.curiosity_scale = 0.25 # scale for curiosity reward 
+        self.reward_sample_fraction = 0.05  # fraction of each batch guaranteed to cover a sparse-reward step
+        self.curiosity_sample_fraction = 0.05  # fraction of each batch guaranteed to cover a sparse-curiosity step
         self.checkpoint_interval = 2 # Save every N episodes
-        self.entropy_scale = 0.0015              # actor entropy bonus weight
-        self.recent_sample_fraction = 0.40      # fraction of each batch drawn from the recent-experience window
+        self.entropy_scale = 0.001             # actor entropy bonus weight
+        self.recent_sample_fraction = 0.35      # fraction of each batch drawn from the recent-experience window
         self.dream_priority_fraction = 0.05         # dream starts resampled by map-novelty
         self.dream_reward_priority_fraction = 0.05  # dream starts resampled by sparse reward
         self.dream_lead_steps = 10                  # rewind prioritized starts this many steps
+        self.dream_horizon = 30                     # number of env steps imagined per dream
+        self.continue_discount = 0.999              # per-step continue/discount factor
         self.ltm_gate_threshold = 0.4
         self.grid_gate_threshold = 0.5
         self.critic_ema_decay = 0.98
@@ -80,6 +82,7 @@ class Policy(nn.Module):
             grid_gate_threshold=self.grid_gate_threshold,
             critic_ema_decay=self.critic_ema_decay,
             curiosity_critic_ema_decay=self.curiosity_critic_ema_decay,
+            continue_discount=self.continue_discount,
         )
 
     def train(self):
@@ -176,7 +179,8 @@ class Policy(nn.Module):
                         sample, compute_metrics=compute_metrics)
                     # Catch all three dreams (dream starts are partially prioritized by actual curiosities)
                     dream_metrics, best_dream, rand_dream, cur_dream = self.dreamer.Dream(
-                        full_states, batch_data=sample, dream_priorities=dream_priorities,
+                        full_states, batch_data=sample, horizon=self.dream_horizon,
+                        dream_priorities=dream_priorities,
                         compute_metrics=compute_metrics,
                     )
 

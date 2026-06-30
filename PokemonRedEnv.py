@@ -23,6 +23,15 @@ PROLOGUE_LTM_END = (WEVENTFLAGS_START - RAM_EVENTS_REGION_START) * 8 + EVENT_GOT
 # Noisy event flags to exclude from reward, by LTM index
 IGNORED_EVENT_INDICES = (1032,)
 
+# LTM indices with special handling / pretty logging.
+# Pewter Gym trainer #0: real event flag 0xD755 bit 2 -> (0xD755-0xD73E)*8+2.
+PEWTER_TRAINER_LTM_INDEX = 186
+# Brock-battle-start: NOT a persistent event flag, so we repurpose a safe
+# in-region late-game slot (originally EVENT_BEAT_BLAINE, never reached in early
+# training) and synthesize the bit in _get_event_bits(). This lets the +50 reward
+# AND the dream-gate flow through the normal event-bit pipeline with no dim change.
+BROCK_BATTLE_LTM_INDEX = 737
+
 # Maps to track for the curiosity bonus
 MONITORED_MAPS = [
     # --- Pallet -> Pewter (Brock) ---
@@ -169,6 +178,13 @@ MAP_NAMES = {
 # enters each monitored map.
 MAP_CURIOSITY_BONUS = 1.0
 
+# Per-map overrides for maps that deserve a larger one-time exploration bonus.
+# Pewter Gym (54) gets a boost because the policy tends to avoid it after losing
+# to Brock; a stronger entry incentive counteracts that learned avoidance.
+MAP_CURIOSITY_BONUS_OVERRIDES = {
+    54: 5.0,    # Pewter Gym (Brock)
+}
+
 # Tile (intra-map) curiosity: a dense, STATIC exploration bonus granted the first
 # time each (map, x, y) tile is stepped on this episode. No decay: every newly
 # visited tile pays exactly TILE_CURIOSITY_BONUS. Localising *where* this bonus
@@ -239,8 +255,8 @@ class PokemonRedEnv(gym.Env):
         # --- REWARDS CONSTANTS ---
         self.step_increase = 2500
         self.reward_event_val = 50   
-        self.reward_heal_mult = 2.5
-        self.reward_lvl_mult = 5
+        self.reward_heal_mult = 5
+        self.reward_lvl_mult = 10
         
         # Action Space Definition (7 buttons)
         self.buttons =[
@@ -270,7 +286,7 @@ class PokemonRedEnv(gym.Env):
         self.last_hp_fraction_sum = 0
         self.last_party_count = 0
         self.level_reward_decay_rate = 0.85
-        self.episode_level_ups = 0 
+        self.episode_level_ups = 0
         self.brock_defeated = False
     # ==========================================================
     # EMULATOR & RAM HELPERS
@@ -398,11 +414,14 @@ class PokemonRedEnv(gym.Env):
         # --- MAP_CURIOSITY_BONUS ---
         sparse_curiosity = 0.0
         if map_id in MONITORED_MAPS_SET and map_id not in self.curiosity_triggered_maps:
-            sparse_curiosity = MAP_CURIOSITY_BONUS
+            sparse_curiosity = MAP_CURIOSITY_BONUS_OVERRIDES.get(map_id, MAP_CURIOSITY_BONUS)
             self.curiosity_triggered_maps.add(map_id)
             if self.verbose:
                 map_name = MAP_NAMES.get(map_id, f"Map ID {map_id}")
-                logs.append(f"[CURIOSITY BONUS] +{MAP_CURIOSITY_BONUS} awarded for transitioning to {map_name}")
+                if map_id == 54:  # Pewter Gym — highlight the entry (bold cyan)
+                    logs.append(f"\033[1;96m>>> [GYM ENTERED] +{sparse_curiosity} | {map_name} <<<\033[0m")
+                else:
+                    logs.append(f"[CURIOSITY BONUS] +{sparse_curiosity} awarded for transitioning to {map_name}")
 
         # --- TILE_CURIOSITY_BONUS ---
         explored_grid = self._get_explored_grid(coord)
@@ -424,9 +443,14 @@ class PokemonRedEnv(gym.Env):
             newly_on = np.where((current_event_bits > 0.5) & (self.last_event_bits < 0.5))[0]
             for idx in newly_on:
                 idx = int(idx)
-                addr = RAM_EVENTS_REGION_START + idx // 8
-                bit = idx % 8
-                logs.append(f"[EVENT REWARD] Triggered by Memory Address: {hex(addr)}, Bit: {bit} (LTM idx {idx})")
+                if idx == PEWTER_TRAINER_LTM_INDEX:
+                    logs.append("\033[1;92m>>> [GYM TRAINER DEFEATED] +50.0 | first Pewter Gym trainer <<<\033[0m")
+                elif idx == BROCK_BATTLE_LTM_INDEX:
+                    logs.append("\033[1;95m>>> [BROCK BATTLE STARTED] +50.0  (here we go!) <<<\033[0m")
+                else:
+                    addr = RAM_EVENTS_REGION_START + idx // 8
+                    bit = idx % 8
+                    logs.append(f"[EVENT REWARD] Triggered by Memory Address: {hex(addr)}, Bit: {bit} (LTM idx {idx})")
 
             self.max_step_limit += (new_events * self.step_increase)
             self.max_events = current_events
@@ -472,16 +496,16 @@ class PokemonRedEnv(gym.Env):
         current_lvl_val = self._calculate_level_reward(total_level)
         if current_lvl_val > self.max_level_reward:
             lvl_gain = current_lvl_val - self.max_level_reward
-            
-            # Decay 
-            decayed_lvl_gain = lvl_gain * (self.level_reward_decay_rate ** self.episode_level_ups)
-            standard_reward += decayed_lvl_gain
-            
+
+            # Flat level reward: no within-episode decay, every level-up keeps
+            # its full value (+5.0 per level below the Eq.(2) cap).
+            standard_reward += lvl_gain
+
             self.max_level_reward = current_lvl_val
-            self.episode_level_ups += 1  
-            
+            self.episode_level_ups += 1
+
             if self.verbose:
-                logs.append(f"[LEVEL] +{decayed_lvl_gain:.3f} | Total Party Level up to: {total_level}")
+                logs.append(f"[LEVEL] +{lvl_gain:.3f} | Total Party Level up to: {total_level}")
 
         # --- ITEM REWARD ---
         if not self.has_obtained_pokeball:
@@ -594,7 +618,14 @@ class PokemonRedEnv(gym.Env):
             bytes(self.pyboy.memory[RAM_EVENTS_REGION_START:RAM_EVENTS_REGION_END]),
             dtype=np.uint8,
         )
-        return np.unpackbits(block, bitorder="little").astype(np.float32)
+        bits = np.unpackbits(block, bitorder="little").astype(np.float32)
+        # Repurposed slot: synthesize a "Brock battle active" event bit so its reward
+        # and dream-gate flow through the normal event-bit pipeline. Trainer battle
+        # (wIsInBattle 0xD057 == 2) vs OPP_BROCK (wCurOpponent 0xD059 == 234).
+        bits[BROCK_BATTLE_LTM_INDEX] = (
+            1.0 if (self.pyboy.memory[0xD057] == 2 and self.pyboy.memory[0xD059] == 234) else 0.0
+        )
+        return bits
 
     def _get_new_event_bits(self):
         """Reward-eligible event bits: start-state flags and the prologue/ignored region

@@ -485,7 +485,7 @@ class Buffer(object):
         # `recent_sample_fraction` of the batch comes from a recent window, the
         # remainder uniformly across the whole buffer.
         if num_recent > 0:
-            effective_window = min(20000 * self.num_envs, N)
+            effective_window = min(25000 * self.num_envs, N)
             max_offset = effective_window - sequenceSize
             if max_offset >= 0:
                 offsets = torch.randint(0, max_offset + 1, (num_recent, 1))
@@ -654,7 +654,8 @@ class Dreamer:
                  teamitem_out=128, ltm_reward_out=512, ltm_map_out=256, grid_out=128,
                  dream_priority_fraction=0.05, dream_reward_priority_fraction=0.05,
                  dream_lead_steps=10, ltm_gate_threshold=0.3, grid_gate_threshold=0.5,
-                 critic_ema_decay=0.98, curiosity_critic_ema_decay=0.90):
+                 critic_ema_decay=0.98, curiosity_critic_ema_decay=0.90,
+                 continue_discount=0.997):
 
         # --- Dimensions / config ---
         self.device = device
@@ -756,6 +757,7 @@ class Dreamer:
 
         self.critic_ema_decay = critic_ema_decay
         self.curiosity_critic_ema_decay = curiosity_critic_ema_decay
+        self.continue_discount = continue_discount
 
         # --- Buffer ---
         self.buffer = Buffer(
@@ -1128,7 +1130,7 @@ class Dreamer:
 
         # --- Lambda returns ---
         with torch.no_grad():
-            continues = torch.full_like(predicted_rewards, 0.997)
+            continues = torch.full_like(predicted_rewards, self.continue_discount)
             lambda_values = self.computeLambdaValues(predicted_rewards, online_values, continues)
             curiosity_lambda_values = self.computeLambdaValues(predicted_curiosity, online_curiosity_values, continues)
 
@@ -1166,7 +1168,7 @@ class Dreamer:
                                 + batch_data["standard_rewards"][:, 1:]).squeeze(-1)  # [B, Tr]
                 with torch.no_grad():
                     v_real = self.two_hot.decode(self.critic(real_states)).squeeze(-1)  # [B, Tr]
-                    replay_continues = torch.full_like(real_rewards[:, :-1], 0.997)
+                    replay_continues = torch.full_like(real_rewards[:, :-1], self.continue_discount)
                     replay_returns = self.computeLambdaValues(
                         real_rewards[:, :-1], v_real, replay_continues)                 # [B, Tr-1]
                     replay_target_two_hot = self.two_hot.encode(replay_returns)
